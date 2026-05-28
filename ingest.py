@@ -1,5 +1,5 @@
 import os
-from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.document_loaders import PyPDFDirectoryLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_chroma import Chroma
@@ -18,9 +18,10 @@ if not MY_API_KEY:
 os.environ["GOOGLE_API_KEY"] = MY_API_KEY
 
 def build_vector_db():
-    print("Lade Dokument...")
-    loader = PyPDFLoader("sample_document.pdf")
+    print("Lade alle PDFs aus dem Ordner './data'...")
+    loader = PyPDFDirectoryLoader("./data")
     docs = loader.load()
+    print(f"Es wurden {len(docs)} Seiten aus mehreren Dokumenten geladen!")
 
     print("Teile Text in Chunks (Abschnitte)...")
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
