@@ -1,0 +1,3 @@
+{"id": "source-citation-basic", "question": "Welche Informationen stehen im Dokument?", "min_sources": 1}
+{"id": "garden-guide-source", "question": "Welches Dokument enthaelt Informationen zur Gartenpflege?", "expected_source_contains": "Gartenpflege", "min_sources": 1}
+{"id": "unknown-answer", "question": "Welche Urlaubsregelung gilt fuer Mitarbeiter in diesem Unternehmen?", "should_refuse": true, "min_sources": 0}

@@ -1,22 +1,29 @@
 name: RAG CI Pipeline
 
-# 1. Wann soll die Pipeline starten? (Bei jedem Push auf den Haupt-Branch)
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: ["main", "master"]
   pull_request:
-    branches: [ "main", "master" ]
+    branches: ["main", "master"]
 
 jobs:
   build-and-test:
-    # 2. Auf welchem Betriebssystem soll die Cloud-Maschine laufen?
     runs-on: ubuntu-latest
 
     steps:
-    # 3. Code auf den Cloud-Server laden
-    - name: Code auschecken
-      uses: actions/checkout@v4
+      - name: Check out code
+        uses: actions/checkout@v4
 
-    # 4. Prüfen, ob der Container fehlerfrei baut
-    - name: Docker Image bauen (Test)
-      run: docker build -t rag-backend:test .
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: pytest
+
+      - name: Build Docker image
+        run: docker build -t rag-backend:test .

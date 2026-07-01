@@ -1,0 +1,24 @@
+services:
+  backend:
+    build: .
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./chroma_db:/app/chroma_db
+
+  frontend:
+    build: .
+    env_file:
+      - .env
+    environment:
+      RAG_API_URL: http://backend:8000/ask
+      RAG_DOCUMENTS_URL: http://backend:8000/documents
+      RAG_REINDEX_URL: http://backend:8000/reindex
+    command: streamlit run frontend.py --server.address 0.0.0.0 --server.port 8501
+    ports:
+      - "8501:8501"
+    depends_on:
+      - backend

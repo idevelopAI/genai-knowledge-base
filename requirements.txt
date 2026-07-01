@@ -11,3 +11,6 @@ pypdf
 python-dotenv
 streamlit
 requests
+pytest
+httpx
+python-multipart

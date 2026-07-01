@@ -1,4 +1,13 @@
 .env
+.env.*
 .venv/
 __pycache__/
 chroma_db/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.pyc
+.DS_Store
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*

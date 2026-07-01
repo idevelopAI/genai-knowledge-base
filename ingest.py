@@ -1,42 +1,43 @@
 import os
-from langchain_community.document_loaders import PyPDFDirectoryLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
-from langchain_chroma import Chroma
+
 from dotenv import load_dotenv
 
-# 1. Lädt heimlich deinen Key aus der .env Datei
-load_dotenv()  
+from rag_index import build_vector_db
 
-# 2. Holt den Key sicher ins Skript
-MY_API_KEY = os.environ.get("GOOGLE_API_KEY")
-if not MY_API_KEY:
-    raise ValueError("Sicherheitsfehler: GOOGLE_API_KEY wurde nicht gefunden!")
 
-# 3. Wir setzen ihn für LangChain wieder in die Umgebung, 
-# aber diesmal sicher aus der versteckten Datei!
-os.environ["GOOGLE_API_KEY"] = MY_API_KEY
+load_dotenv()
 
-def build_vector_db():
-    print("Lade alle PDFs aus dem Ordner './data'...")
-    loader = PyPDFDirectoryLoader("./data")
-    docs = loader.load()
-    print(f"Es wurden {len(docs)} Seiten aus mehreren Dokumenten geladen!")
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+DATA_DIR = os.environ.get("DATA_DIR", "./data")
+CHROMA_DB_DIR = os.environ.get("CHROMA_DB_DIR", "./chroma_db")
+CHROMA_COLLECTION_NAME = os.environ.get("CHROMA_COLLECTION_NAME", "langchain")
+RAG_CHUNK_SIZE = int(os.environ.get("RAG_CHUNK_SIZE", "1000"))
+RAG_CHUNK_OVERLAP = int(os.environ.get("RAG_CHUNK_OVERLAP", "200"))
+GEMINI_EMBEDDING_MODEL = os.environ.get(
+    "GEMINI_EMBEDDING_MODEL", "models/gemini-embedding-001"
+)
 
-    print("Teile Text in Chunks (Abschnitte)...")
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    splits = text_splitter.split_documents(docs)
 
-    print("Generiere Embeddings und speichere in ChromaDB...")
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
-    
-    # Dies erstellt die lokale Vektordatenbank im Ordner ./chroma_db
-    vectorstore = Chroma.from_documents(
-        documents=splits, 
-        embedding=embeddings, 
-        persist_directory="./chroma_db"
+def build_vector_database():
+    if not GOOGLE_API_KEY:
+        raise ValueError("Sicherheitsfehler: GOOGLE_API_KEY wurde nicht gefunden!")
+
+    print(f"Lade PDFs aus '{DATA_DIR}'...")
+    stats = build_vector_db(
+        data_dir=DATA_DIR,
+        persist_directory=CHROMA_DB_DIR,
+        embedding_model=GEMINI_EMBEDDING_MODEL,
+        google_api_key=GOOGLE_API_KEY,
+        collection_name=CHROMA_COLLECTION_NAME,
+        chunk_size=RAG_CHUNK_SIZE,
+        chunk_overlap=RAG_CHUNK_OVERLAP,
     )
-    print("Datenbank erfolgreich erstellt!")
+    print(
+        "Datenbank erfolgreich erstellt: "
+        f"{stats.pdf_count} PDFs, {stats.pages_loaded} Seiten, "
+        f"{stats.chunks_created} Chunks."
+    )
+
 
 if __name__ == "__main__":
-    build_vector_db()
+    build_vector_database()

@@ -2,3 +2,14 @@
 __pycache__/
 *.pyc
 .DS_Store
+.env
+.env.*
+.git/
+.github/
+chroma_db/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
