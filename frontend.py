@@ -16,6 +16,13 @@ API_URL = os.environ.get("RAG_API_URL", "http://127.0.0.1:8000/ask")
 API_BASE_URL = API_URL.removesuffix("/ask")
 DOCUMENTS_URL = os.environ.get("RAG_DOCUMENTS_URL", f"{API_BASE_URL}/documents")
 REINDEX_URL = os.environ.get("RAG_REINDEX_URL", f"{API_BASE_URL}/reindex")
+RAG_API_TOKEN = os.environ.get("RAG_API_TOKEN")
+
+
+def auth_headers():
+    if not RAG_API_TOKEN:
+        return {}
+    return {"Authorization": f"Bearer {RAG_API_TOKEN}"}
 
 
 def render_sources(sources):
@@ -32,7 +39,7 @@ def render_sources(sources):
 
 def refresh_document_list():
     try:
-        response = requests.get(DOCUMENTS_URL, timeout=10)
+        response = requests.get(DOCUMENTS_URL, headers=auth_headers(), timeout=10)
         response.raise_for_status()
         return response.json().get("documents", [])
     except requests.exceptions.RequestException:
@@ -60,7 +67,12 @@ with st.sidebar:
                         "application/pdf",
                     )
                 }
-                response = requests.post(DOCUMENTS_URL, files=files, timeout=180)
+                response = requests.post(
+                    DOCUMENTS_URL,
+                    files=files,
+                    headers=auth_headers(),
+                    timeout=180,
+                )
                 response.raise_for_status()
                 payload = response.json()
                 st.success(
@@ -74,7 +86,11 @@ with st.sidebar:
     if st.button("Index neu erstellen"):
         with st.spinner("Index wird neu erstellt..."):
             try:
-                response = requests.post(REINDEX_URL, timeout=180)
+                response = requests.post(
+                    REINDEX_URL,
+                    headers=auth_headers(),
+                    timeout=180,
+                )
                 response.raise_for_status()
                 payload = response.json()
                 st.success(
@@ -104,7 +120,12 @@ if prompt := st.chat_input("Deine Frage an das Dokument..."):
         message_placeholder.markdown("*(KI ueberlegt...)*")
 
         try:
-            response = requests.post(API_URL, json={"question": prompt}, timeout=60)
+            response = requests.post(
+                API_URL,
+                json={"question": prompt},
+                headers=auth_headers(),
+                timeout=60,
+            )
             response.raise_for_status()
 
             payload = response.json()

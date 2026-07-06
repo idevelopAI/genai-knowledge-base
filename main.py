@@ -1,9 +1,10 @@
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
@@ -15,6 +16,7 @@ from rag_index import IndexStats, build_vector_db, list_pdf_files, save_pdf_byte
 
 
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 
 
 def _positive_int_from_env(name: str, default: int) -> int:
@@ -32,6 +34,7 @@ def _positive_int_from_env(name: str, default: int) -> int:
 
 
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+RAG_API_TOKEN = os.environ.get("RAG_API_TOKEN")
 DATA_DIR = os.environ.get("DATA_DIR", "./data")
 CHROMA_DB_DIR = os.environ.get("CHROMA_DB_DIR", "./chroma_db")
 CHROMA_COLLECTION_NAME = os.environ.get("CHROMA_COLLECTION_NAME", "langchain")
@@ -76,6 +79,19 @@ class IndexResponse(BaseModel):
 
 class UploadResponse(IndexResponse):
     filename: str
+
+
+def _elapsed_ms(start_time: float) -> int:
+    return round((time.perf_counter() - start_time) * 1000)
+
+
+def _require_api_token(authorization: str | None = Header(default=None)) -> None:
+    if not RAG_API_TOKEN:
+        return
+
+    expected = f"Bearer {RAG_API_TOKEN}"
+    if authorization != expected:
+        raise HTTPException(status_code=401, detail="Invalid or missing API token.")
 
 
 system_prompt = (
@@ -145,6 +161,7 @@ def _reload_rag_components() -> None:
 
 def _rebuild_vector_store() -> IndexStats:
     google_api_key = _require_google_api_key()
+    start_time = time.perf_counter()
 
     try:
         stats = build_vector_db(
@@ -157,11 +174,27 @@ def _rebuild_vector_store() -> IndexStats:
             chunk_overlap=RAG_CHUNK_OVERLAP,
         )
         _reload_rag_components()
+        logger.info(
+            "rag_index_rebuilt status=success pdf_count=%s pages_loaded=%s "
+            "chunks_created=%s elapsed_ms=%s",
+            stats.pdf_count,
+            stats.pages_loaded,
+            stats.chunks_created,
+            _elapsed_ms(start_time),
+        )
         return stats
     except ValueError as exc:
+        logger.warning(
+            "rag_index_rebuilt status=invalid_request elapsed_ms=%s error=%s",
+            _elapsed_ms(start_time),
+            exc,
+        )
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception:
-        logger.exception("Failed to rebuild vector store")
+        logger.exception(
+            "rag_index_rebuilt status=error elapsed_ms=%s",
+            _elapsed_ms(start_time),
+        )
         raise HTTPException(
             status_code=500,
             detail="Unable to rebuild the vector store right now.",
@@ -224,21 +257,34 @@ async def health() -> dict[str, bool | str | int]:
     }
 
 
-@app.get("/documents", response_model=DocumentListResponse)
+@app.get(
+    "/documents",
+    response_model=DocumentListResponse,
+    dependencies=[Depends(_require_api_token)],
+)
 async def list_documents() -> DocumentListResponse:
     return DocumentListResponse(
         documents=[path.name for path in list_pdf_files(DATA_DIR)],
     )
 
 
-@app.post("/reindex", response_model=IndexResponse)
+@app.post(
+    "/reindex",
+    response_model=IndexResponse,
+    dependencies=[Depends(_require_api_token)],
+)
 async def reindex_documents() -> IndexResponse:
     stats = _rebuild_vector_store()
     return _index_response(stats, status="reindexed")
 
 
-@app.post("/documents", response_model=UploadResponse)
+@app.post(
+    "/documents",
+    response_model=UploadResponse,
+    dependencies=[Depends(_require_api_token)],
+)
 async def upload_document(file: UploadFile = File(...)) -> UploadResponse:
+    start_time = time.perf_counter()
     filename = file.filename or ""
     if not filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF uploads are supported.")
@@ -250,6 +296,15 @@ async def upload_document(file: UploadFile = File(...)) -> UploadResponse:
 
     saved_path = save_pdf_bytes(contents, filename, DATA_DIR)
     stats = _rebuild_vector_store()
+    logger.info(
+        "rag_document_uploaded filename=%s bytes=%s pdf_count=%s chunks_created=%s "
+        "elapsed_ms=%s",
+        saved_path.name,
+        len(contents),
+        stats.pdf_count,
+        stats.chunks_created,
+        _elapsed_ms(start_time),
+    )
     return UploadResponse(
         filename=saved_path.name,
         status="uploaded_and_indexed",
@@ -261,8 +316,13 @@ async def upload_document(file: UploadFile = File(...)) -> UploadResponse:
     )
 
 
-@app.post("/ask", response_model=QueryResponse)
+@app.post(
+    "/ask",
+    response_model=QueryResponse,
+    dependencies=[Depends(_require_api_token)],
+)
 async def ask_question(request: QueryRequest) -> QueryResponse:
+    request_start = time.perf_counter()
     if retriever is None or llm is None:
         raise HTTPException(
             status_code=503,
@@ -270,7 +330,11 @@ async def ask_question(request: QueryRequest) -> QueryResponse:
         )
 
     try:
+        retrieval_start = time.perf_counter()
         docs = retriever.invoke(request.question)
+        retrieval_ms = _elapsed_ms(retrieval_start)
+
+        llm_start = time.perf_counter()
         chain = prompt | llm | StrOutputParser()
         answer = chain.invoke(
             {
@@ -278,9 +342,24 @@ async def ask_question(request: QueryRequest) -> QueryResponse:
                 "question": request.question,
             }
         )
+        llm_ms = _elapsed_ms(llm_start)
+        total_ms = _elapsed_ms(request_start)
+        logger.info(
+            "rag_question_answered status=success question_chars=%s sources=%s "
+            "retrieval_ms=%s llm_ms=%s total_ms=%s",
+            len(request.question),
+            len(docs),
+            retrieval_ms,
+            llm_ms,
+            total_ms,
+        )
         return QueryResponse(answer=answer, sources=build_sources(docs))
     except Exception:
-        logger.exception("Failed to answer RAG question")
+        logger.exception(
+            "rag_question_answered status=error question_chars=%s total_ms=%s",
+            len(request.question),
+            _elapsed_ms(request_start),
+        )
         raise HTTPException(
             status_code=500,
             detail="Unable to generate an answer right now.",

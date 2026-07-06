@@ -33,6 +33,30 @@ def test_ask_returns_503_when_rag_is_not_configured(monkeypatch):
     assert "GOOGLE_API_KEY" in response.json()["detail"]
 
 
+def test_ask_requires_bearer_token_when_configured(monkeypatch):
+    monkeypatch.setattr(main, "RAG_API_TOKEN", "test-token")
+
+    response = client.post("/ask", json={"question": "What is in the document?"})
+
+    assert response.status_code == 401
+    assert "token" in response.json()["detail"].lower()
+
+
+def test_ask_accepts_bearer_token_when_configured(monkeypatch):
+    monkeypatch.setattr(main, "RAG_API_TOKEN", "test-token")
+    monkeypatch.setattr(main, "retriever", None)
+    monkeypatch.setattr(main, "llm", None)
+
+    response = client.post(
+        "/ask",
+        json={"question": "What is in the document?"},
+        headers={"Authorization": "Bearer test-token"},
+    )
+
+    assert response.status_code == 503
+    assert "GOOGLE_API_KEY" in response.json()["detail"]
+
+
 def test_list_documents_returns_pdf_names(tmp_path, monkeypatch):
     (tmp_path / "sample.pdf").write_bytes(b"%PDF-1.4\n")
     (tmp_path / "notes.txt").write_text("not a pdf")
@@ -42,6 +66,14 @@ def test_list_documents_returns_pdf_names(tmp_path, monkeypatch):
 
     assert response.status_code == 200
     assert response.json() == {"documents": ["sample.pdf"]}
+
+
+def test_list_documents_requires_token_when_configured(monkeypatch):
+    monkeypatch.setattr(main, "RAG_API_TOKEN", "test-token")
+
+    response = client.get("/documents")
+
+    assert response.status_code == 401
 
 
 def test_upload_rejects_non_pdf_files():

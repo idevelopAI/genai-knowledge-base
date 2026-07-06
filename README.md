@@ -61,6 +61,8 @@ PDF documents
 - Provides a Streamlit chat interface for interactive use.
 - Includes a lightweight RAG evaluation runner.
 - Includes Docker packaging and a GitHub Actions CI workflow.
+- Supports optional bearer-token API protection with `RAG_API_TOKEN`.
+- Logs request timing, retrieval timing, LLM timing, and indexing metrics.
 - Keeps secrets out of tracked code and Docker build context.
 
 ## Project Status
@@ -78,14 +80,15 @@ Current hardening work includes:
 - Source-cited RAG responses.
 - PDF upload and reindex workflow.
 - Basic JSONL-driven RAG eval checks.
+- Optional API token protection.
+- Structured observability logs for RAG and indexing paths.
 
 Planned improvements:
 
 - Add more RAG evaluation cases.
-- Add authentication/rate limiting for the API.
 - Complete Azure container deployment settings.
-- Add observability for latency, retrieval quality, and failed requests.
 - Add a short demo video or screenshots.
+- Add rate limiting for public deployments.
 
 ## Local Setup
 
@@ -99,6 +102,13 @@ pip install -r requirements.lock.txt
 
 `requirements.txt` lists the direct project dependencies. `requirements.lock.txt`
 pins the full resolved dependency set used by CI and Docker for reproducibility.
+
+To refresh the lock file after dependency changes:
+
+```bash
+pip install -r requirements.txt
+pip freeze > requirements.lock.txt
+```
 
 Create a local `.env` file from the safe example file, then add your real API
 key only in your local `.env` file:
@@ -130,6 +140,19 @@ streamlit run frontend.py
 
 The Streamlit sidebar lets you upload a PDF, rebuild the index, and see the
 documents currently available to the backend.
+
+## Demo Script
+
+After starting the app, try this flow:
+
+1. Open `http://localhost:8501`.
+2. Confirm the sidebar lists the PDFs from `data/`.
+3. Ask: `Welche Informationen stehen im Dokument?`
+4. Expand `Quellen` under the answer and check the source filename/page.
+5. Upload another PDF from the sidebar, click `Hochladen und indexieren`, then
+   ask a question about the new document.
+6. Run `python evals/run_eval.py` while the backend is running to see the basic
+   RAG quality checks.
 
 ## Docker
 
@@ -176,6 +199,12 @@ and checks simple expectations such as source presence, expected source names,
 and refusal behavior.
 
 ## API
+
+If `RAG_API_TOKEN` is set, protected endpoints require:
+
+```text
+Authorization: Bearer <RAG_API_TOKEN>
+```
 
 Health check:
 
@@ -230,15 +259,39 @@ Example response shape:
 - Real secrets must stay in local environment variables or `.env`.
 - `.env` and `.env.*` are ignored by Git and Docker.
 - `example.env` contains placeholder values only.
+- Set `RAG_API_TOKEN` to require bearer-token access for `/ask`, `/documents`,
+  and `/reindex`.
 - API errors avoid returning raw internal exception text to users.
 
 If a real API key is ever committed, rotate the key immediately and remove it
 from Git history.
 
+## Observability
+
+The API logs structured events for the important paths:
+
+- `rag_question_answered`: question length, source count, retrieval time, LLM
+  time, and total request time.
+- `rag_index_rebuilt`: PDF count, loaded pages, generated chunks, and indexing
+  time.
+- `rag_document_uploaded`: saved filename, upload size, resulting PDF count,
+  chunk count, and total upload/index time.
+
+Use `LOG_LEVEL=INFO` locally or in deployment to keep these metrics visible.
+
 ## CI
 
 GitHub Actions validates the project by installing dependencies, running tests,
 and building the Docker image.
+
+## Dependency Management
+
+- `requirements.txt` contains direct dependencies that describe what the project
+  intentionally uses.
+- `requirements.lock.txt` pins the full resolved environment used by CI and
+  Docker.
+- After changing direct dependencies, regenerate the lock file with
+  `pip freeze > requirements.lock.txt` from a freshly installed environment.
 
 ## Terraform
 
