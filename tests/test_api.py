@@ -13,6 +13,10 @@ import main  # noqa: E402
 client = TestClient(main.app)
 
 
+def setup_function():
+    main.rate_limit_events.clear()
+
+
 def test_health_is_available_without_api_key():
     response = client.get("/health")
 
@@ -74,6 +78,32 @@ def test_list_documents_requires_token_when_configured(monkeypatch):
     response = client.get("/documents")
 
     assert response.status_code == 401
+
+
+def test_rate_limit_blocks_expensive_endpoints(monkeypatch):
+    monkeypatch.setattr(main, "RAG_API_TOKEN", None)
+    monkeypatch.setattr(main, "RAG_RATE_LIMIT_REQUESTS", 1)
+    monkeypatch.setattr(main, "RAG_RATE_LIMIT_WINDOW_SECONDS", 60)
+    main.rate_limit_events.clear()
+
+    first_response = client.get("/documents")
+    second_response = client.get("/documents")
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 429
+    assert "Retry-After" in second_response.headers
+
+
+def test_rate_limit_can_be_disabled(monkeypatch):
+    monkeypatch.setattr(main, "RAG_API_TOKEN", None)
+    monkeypatch.setattr(main, "RAG_RATE_LIMIT_REQUESTS", 0)
+    main.rate_limit_events.clear()
+
+    first_response = client.get("/documents")
+    second_response = client.get("/documents")
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
 
 
 def test_upload_rejects_non_pdf_files():

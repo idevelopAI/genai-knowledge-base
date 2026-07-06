@@ -50,6 +50,9 @@ PDF documents
   embedding-model changes.
 - Local vector storage is convenient for demos, but it does not solve multi-user
   concurrency, centralized persistence, auditability, or horizontal scaling.
+- The built-in rate limiter is process-local. For production with multiple app
+  instances, use shared infrastructure such as Redis, API Management, or an
+  ingress-level rate limiter.
 
 ## Features
 
@@ -62,6 +65,7 @@ PDF documents
 - Includes a lightweight RAG evaluation runner.
 - Includes Docker packaging and a GitHub Actions CI workflow.
 - Supports optional bearer-token API protection with `RAG_API_TOKEN`.
+- Includes configurable in-memory rate limiting for expensive API routes.
 - Logs request timing, retrieval timing, LLM timing, and indexing metrics.
 - Keeps secrets out of tracked code and Docker build context.
 
@@ -81,6 +85,7 @@ Current hardening work includes:
 - PDF upload and reindex workflow.
 - Basic JSONL-driven RAG eval checks.
 - Optional API token protection.
+- Configurable in-memory rate limiting.
 - Structured observability logs for RAG and indexing paths.
 
 Planned improvements:
@@ -88,7 +93,8 @@ Planned improvements:
 - Add more RAG evaluation cases.
 - Complete Azure container deployment settings.
 - Add a short demo video or screenshots.
-- Add rate limiting for public deployments.
+- Replace in-memory rate limiting with shared infrastructure for multi-instance
+  deployments.
 
 ## Local Setup
 
@@ -206,6 +212,10 @@ If `RAG_API_TOKEN` is set, protected endpoints require:
 Authorization: Bearer <RAG_API_TOKEN>
 ```
 
+The expensive endpoints are rate-limited by default using
+`RAG_RATE_LIMIT_REQUESTS=60` per `RAG_RATE_LIMIT_WINDOW_SECONDS=60`. Set
+`RAG_RATE_LIMIT_REQUESTS=0` to disable this locally.
+
 Health check:
 
 ```bash
@@ -261,6 +271,8 @@ Example response shape:
 - `example.env` contains placeholder values only.
 - Set `RAG_API_TOKEN` to require bearer-token access for `/ask`, `/documents`,
   and `/reindex`.
+- `RAG_RATE_LIMIT_REQUESTS` and `RAG_RATE_LIMIT_WINDOW_SECONDS` limit repeated
+  calls to `/ask`, `/documents`, and `/reindex`.
 - API errors avoid returning raw internal exception text to users.
 
 If a real API key is ever committed, rotate the key immediately and remove it
@@ -276,6 +288,8 @@ The API logs structured events for the important paths:
   time.
 - `rag_document_uploaded`: saved filename, upload size, resulting PDF count,
   chunk count, and total upload/index time.
+- `rag_rate_limited`: client key, configured limit, window size, and retry delay
+  when a request receives HTTP 429.
 
 Use `LOG_LEVEL=INFO` locally or in deployment to keep these metrics visible.
 

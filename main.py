@@ -1,10 +1,11 @@
 import logging
 import os
 import time
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
@@ -33,6 +34,20 @@ def _positive_int_from_env(name: str, default: int) -> int:
     return max(1, value)
 
 
+def _non_negative_int_from_env(name: str, default: int) -> int:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+
+    try:
+        value = int(raw_value)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %s", name, raw_value, default)
+        return default
+
+    return max(0, value)
+
+
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 RAG_API_TOKEN = os.environ.get("RAG_API_TOKEN")
 DATA_DIR = os.environ.get("DATA_DIR", "./data")
@@ -41,12 +56,17 @@ CHROMA_COLLECTION_NAME = os.environ.get("CHROMA_COLLECTION_NAME", "langchain")
 RAG_TOP_K = _positive_int_from_env("RAG_TOP_K", 3)
 RAG_CHUNK_SIZE = _positive_int_from_env("RAG_CHUNK_SIZE", 1000)
 RAG_CHUNK_OVERLAP = _positive_int_from_env("RAG_CHUNK_OVERLAP", 200)
+RAG_RATE_LIMIT_REQUESTS = _non_negative_int_from_env("RAG_RATE_LIMIT_REQUESTS", 60)
+RAG_RATE_LIMIT_WINDOW_SECONDS = _positive_int_from_env(
+    "RAG_RATE_LIMIT_WINDOW_SECONDS", 60
+)
 GEMINI_EMBEDDING_MODEL = os.environ.get(
     "GEMINI_EMBEDDING_MODEL", "models/gemini-embedding-001"
 )
 GEMINI_CHAT_MODEL = os.environ.get("GEMINI_CHAT_MODEL", "gemini-3.5-flash")
 
 app = FastAPI(title="GenAI Knowledge Base API")
+rate_limit_events: defaultdict[str, deque[float]] = defaultdict(deque)
 
 
 class QueryRequest(BaseModel):
@@ -92,6 +112,47 @@ def _require_api_token(authorization: str | None = Header(default=None)) -> None
     expected = f"Bearer {RAG_API_TOKEN}"
     if authorization != expected:
         raise HTTPException(status_code=401, detail="Invalid or missing API token.")
+
+
+def _rate_limit_key(request: Request, authorization: str | None) -> str:
+    if authorization:
+        return f"token:{authorization}"
+    if request.client and request.client.host:
+        return f"ip:{request.client.host}"
+    return "ip:unknown"
+
+
+def _enforce_rate_limit(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> None:
+    if RAG_RATE_LIMIT_REQUESTS == 0:
+        return
+
+    now = time.monotonic()
+    window_start = now - RAG_RATE_LIMIT_WINDOW_SECONDS
+    key = _rate_limit_key(request, authorization)
+    events = rate_limit_events[key]
+
+    while events and events[0] <= window_start:
+        events.popleft()
+
+    if len(events) >= RAG_RATE_LIMIT_REQUESTS:
+        retry_after = max(1, round(events[0] + RAG_RATE_LIMIT_WINDOW_SECONDS - now))
+        logger.warning(
+            "rag_rate_limited key=%s limit=%s window_seconds=%s retry_after=%s",
+            key,
+            RAG_RATE_LIMIT_REQUESTS,
+            RAG_RATE_LIMIT_WINDOW_SECONDS,
+            retry_after,
+        )
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded. Try again later.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    events.append(now)
 
 
 system_prompt = (
@@ -260,7 +321,7 @@ async def health() -> dict[str, bool | str | int]:
 @app.get(
     "/documents",
     response_model=DocumentListResponse,
-    dependencies=[Depends(_require_api_token)],
+    dependencies=[Depends(_require_api_token), Depends(_enforce_rate_limit)],
 )
 async def list_documents() -> DocumentListResponse:
     return DocumentListResponse(
@@ -271,7 +332,7 @@ async def list_documents() -> DocumentListResponse:
 @app.post(
     "/reindex",
     response_model=IndexResponse,
-    dependencies=[Depends(_require_api_token)],
+    dependencies=[Depends(_require_api_token), Depends(_enforce_rate_limit)],
 )
 async def reindex_documents() -> IndexResponse:
     stats = _rebuild_vector_store()
@@ -281,7 +342,7 @@ async def reindex_documents() -> IndexResponse:
 @app.post(
     "/documents",
     response_model=UploadResponse,
-    dependencies=[Depends(_require_api_token)],
+    dependencies=[Depends(_require_api_token), Depends(_enforce_rate_limit)],
 )
 async def upload_document(file: UploadFile = File(...)) -> UploadResponse:
     start_time = time.perf_counter()
@@ -319,7 +380,7 @@ async def upload_document(file: UploadFile = File(...)) -> UploadResponse:
 @app.post(
     "/ask",
     response_model=QueryResponse,
-    dependencies=[Depends(_require_api_token)],
+    dependencies=[Depends(_require_api_token), Depends(_enforce_rate_limit)],
 )
 async def ask_question(request: QueryRequest) -> QueryResponse:
     request_start = time.perf_counter()
