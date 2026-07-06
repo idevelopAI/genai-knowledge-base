@@ -1,6 +1,7 @@
 import logging
 import os
 import time
+import uuid
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any
@@ -64,6 +65,7 @@ GEMINI_EMBEDDING_MODEL = os.environ.get(
     "GEMINI_EMBEDDING_MODEL", "models/gemini-embedding-001"
 )
 GEMINI_CHAT_MODEL = os.environ.get("GEMINI_CHAT_MODEL", "gemini-3.5-flash")
+REQUEST_ID_HEADER = "X-Request-ID"
 
 app = FastAPI(title="GenAI Knowledge Base API")
 rate_limit_events: defaultdict[str, deque[float]] = defaultdict(deque)
@@ -105,6 +107,44 @@ def _elapsed_ms(start_time: float) -> int:
     return round((time.perf_counter() - start_time) * 1000)
 
 
+def _request_id(request: Request | None) -> str:
+    if request is None:
+        return "unknown"
+    return getattr(request.state, "request_id", "unknown")
+
+
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    request_id = request.headers.get(REQUEST_ID_HEADER) or str(uuid.uuid4())
+    request.state.request_id = request_id
+    start_time = time.perf_counter()
+
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.exception(
+            "http_request_completed status=error request_id=%s method=%s path=%s "
+            "elapsed_ms=%s",
+            request_id,
+            request.method,
+            request.url.path,
+            _elapsed_ms(start_time),
+        )
+        raise
+
+    response.headers[REQUEST_ID_HEADER] = request_id
+    logger.info(
+        "http_request_completed status_code=%s request_id=%s method=%s path=%s "
+        "elapsed_ms=%s",
+        response.status_code,
+        request_id,
+        request.method,
+        request.url.path,
+        _elapsed_ms(start_time),
+    )
+    return response
+
+
 def _require_api_token(authorization: str | None = Header(default=None)) -> None:
     if not RAG_API_TOKEN:
         return
@@ -140,7 +180,9 @@ def _enforce_rate_limit(
     if len(events) >= RAG_RATE_LIMIT_REQUESTS:
         retry_after = max(1, round(events[0] + RAG_RATE_LIMIT_WINDOW_SECONDS - now))
         logger.warning(
-            "rag_rate_limited key=%s limit=%s window_seconds=%s retry_after=%s",
+            "rag_rate_limited request_id=%s key=%s limit=%s window_seconds=%s "
+            "retry_after=%s",
+            _request_id(request),
             key,
             RAG_RATE_LIMIT_REQUESTS,
             RAG_RATE_LIMIT_WINDOW_SECONDS,
@@ -220,9 +262,10 @@ def _reload_rag_components() -> None:
     retriever, llm = _build_rag_components()
 
 
-def _rebuild_vector_store() -> IndexStats:
+def _rebuild_vector_store(request: Request | None = None) -> IndexStats:
     google_api_key = _require_google_api_key()
     start_time = time.perf_counter()
+    request_id = _request_id(request)
 
     try:
         stats = build_vector_db(
@@ -236,8 +279,9 @@ def _rebuild_vector_store() -> IndexStats:
         )
         _reload_rag_components()
         logger.info(
-            "rag_index_rebuilt status=success pdf_count=%s pages_loaded=%s "
-            "chunks_created=%s elapsed_ms=%s",
+            "rag_index_rebuilt status=success request_id=%s pdf_count=%s "
+            "pages_loaded=%s chunks_created=%s elapsed_ms=%s",
+            request_id,
             stats.pdf_count,
             stats.pages_loaded,
             stats.chunks_created,
@@ -246,14 +290,17 @@ def _rebuild_vector_store() -> IndexStats:
         return stats
     except ValueError as exc:
         logger.warning(
-            "rag_index_rebuilt status=invalid_request elapsed_ms=%s error=%s",
+            "rag_index_rebuilt status=invalid_request request_id=%s elapsed_ms=%s "
+            "error=%s",
+            request_id,
             _elapsed_ms(start_time),
             exc,
         )
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception:
         logger.exception(
-            "rag_index_rebuilt status=error elapsed_ms=%s",
+            "rag_index_rebuilt status=error request_id=%s elapsed_ms=%s",
+            request_id,
             _elapsed_ms(start_time),
         )
         raise HTTPException(
@@ -334,8 +381,8 @@ async def list_documents() -> DocumentListResponse:
     response_model=IndexResponse,
     dependencies=[Depends(_require_api_token), Depends(_enforce_rate_limit)],
 )
-async def reindex_documents() -> IndexResponse:
-    stats = _rebuild_vector_store()
+async def reindex_documents(request: Request) -> IndexResponse:
+    stats = _rebuild_vector_store(request)
     return _index_response(stats, status="reindexed")
 
 
@@ -344,7 +391,10 @@ async def reindex_documents() -> IndexResponse:
     response_model=UploadResponse,
     dependencies=[Depends(_require_api_token), Depends(_enforce_rate_limit)],
 )
-async def upload_document(file: UploadFile = File(...)) -> UploadResponse:
+async def upload_document(
+    request: Request,
+    file: UploadFile = File(...),
+) -> UploadResponse:
     start_time = time.perf_counter()
     filename = file.filename or ""
     if not filename.lower().endswith(".pdf"):
@@ -356,10 +406,11 @@ async def upload_document(file: UploadFile = File(...)) -> UploadResponse:
         raise HTTPException(status_code=400, detail="Uploaded PDF is empty.")
 
     saved_path = save_pdf_bytes(contents, filename, DATA_DIR)
-    stats = _rebuild_vector_store()
+    stats = _rebuild_vector_store(request)
     logger.info(
-        "rag_document_uploaded filename=%s bytes=%s pdf_count=%s chunks_created=%s "
-        "elapsed_ms=%s",
+        "rag_document_uploaded request_id=%s filename=%s bytes=%s pdf_count=%s "
+        "chunks_created=%s elapsed_ms=%s",
+        _request_id(request),
         saved_path.name,
         len(contents),
         stats.pdf_count,
@@ -382,7 +433,7 @@ async def upload_document(file: UploadFile = File(...)) -> UploadResponse:
     response_model=QueryResponse,
     dependencies=[Depends(_require_api_token), Depends(_enforce_rate_limit)],
 )
-async def ask_question(request: QueryRequest) -> QueryResponse:
+async def ask_question(query: QueryRequest, request: Request) -> QueryResponse:
     request_start = time.perf_counter()
     if retriever is None or llm is None:
         raise HTTPException(
@@ -392,7 +443,7 @@ async def ask_question(request: QueryRequest) -> QueryResponse:
 
     try:
         retrieval_start = time.perf_counter()
-        docs = retriever.invoke(request.question)
+        docs = retriever.invoke(query.question)
         retrieval_ms = _elapsed_ms(retrieval_start)
 
         llm_start = time.perf_counter()
@@ -400,15 +451,16 @@ async def ask_question(request: QueryRequest) -> QueryResponse:
         answer = chain.invoke(
             {
                 "context": format_docs(docs),
-                "question": request.question,
+                "question": query.question,
             }
         )
         llm_ms = _elapsed_ms(llm_start)
         total_ms = _elapsed_ms(request_start)
         logger.info(
-            "rag_question_answered status=success question_chars=%s sources=%s "
-            "retrieval_ms=%s llm_ms=%s total_ms=%s",
-            len(request.question),
+            "rag_question_answered status=success request_id=%s question_chars=%s "
+            "sources=%s retrieval_ms=%s llm_ms=%s total_ms=%s",
+            _request_id(request),
+            len(query.question),
             len(docs),
             retrieval_ms,
             llm_ms,
@@ -417,8 +469,10 @@ async def ask_question(request: QueryRequest) -> QueryResponse:
         return QueryResponse(answer=answer, sources=build_sources(docs))
     except Exception:
         logger.exception(
-            "rag_question_answered status=error question_chars=%s total_ms=%s",
-            len(request.question),
+            "rag_question_answered status=error request_id=%s question_chars=%s "
+            "total_ms=%s",
+            _request_id(request),
+            len(query.question),
             _elapsed_ms(request_start),
         )
         raise HTTPException(

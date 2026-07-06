@@ -4,7 +4,11 @@ import requests
 import streamlit as st
 
 
-st.set_page_config(page_title="GenAI Wissensdatenbank", page_icon="🤖", layout="centered")
+st.set_page_config(
+    page_title="GenAI Wissensdatenbank",
+    page_icon="🤖",
+    layout="wide",
+)
 
 st.title("🤖 Interaktive Wissensdatenbank")
 st.markdown(

@@ -27,6 +27,20 @@ def test_health_is_available_without_api_key():
     assert "pdf_count" in payload
 
 
+def test_health_returns_generated_request_id():
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.headers["X-Request-ID"]
+
+
+def test_request_id_header_is_preserved():
+    response = client.get("/health", headers={"X-Request-ID": "demo-request-123"})
+
+    assert response.status_code == 200
+    assert response.headers["X-Request-ID"] == "demo-request-123"
+
+
 def test_ask_returns_503_when_rag_is_not_configured(monkeypatch):
     monkeypatch.setattr(main, "retriever", None)
     monkeypatch.setattr(main, "llm", None)

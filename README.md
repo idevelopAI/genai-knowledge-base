@@ -42,6 +42,16 @@ flowchart LR
     API --> Loader
 ```
 
+## Screenshots
+
+Chat answers include expandable source citations:
+
+![Streamlit chat answer with source citations](docs/screenshots/chat-with-sources.png)
+
+The sidebar supports document discovery, PDF upload, and manual reindexing:
+
+![Streamlit sidebar upload and reindex controls](docs/screenshots/upload-reindex-sidebar.png)
+
 ## Tech Stack
 
 - Backend: Python, FastAPI, Pydantic
@@ -78,6 +88,8 @@ flowchart LR
 - Includes Docker packaging and a GitHub Actions CI workflow.
 - Supports optional bearer-token API protection with `RAG_API_TOKEN`.
 - Includes configurable in-memory rate limiting for expensive API routes.
+- Adds `X-Request-ID` headers for request tracing across API responses and
+  logs.
 - Logs request timing, retrieval timing, LLM timing, and indexing metrics.
 - Keeps secrets out of tracked code and Docker build context.
 
@@ -99,12 +111,12 @@ Current hardening work includes:
 - Optional API token protection.
 - Configurable in-memory rate limiting.
 - Structured observability logs for RAG and indexing paths.
+- Request IDs for correlating client errors, server logs, and API responses.
 
 Planned improvements:
 
 - Add more RAG evaluation cases.
 - Complete Azure container deployment settings.
-- Add a short demo video or screenshots.
 - Replace in-memory rate limiting with shared infrastructure for multi-instance
   deployments.
 
@@ -230,6 +242,10 @@ The expensive endpoints are rate-limited by default using
 `RAG_RATE_LIMIT_REQUESTS=60` per `RAG_RATE_LIMIT_WINDOW_SECONDS=60`. Set
 `RAG_RATE_LIMIT_REQUESTS=0` to disable this locally.
 
+Every API response includes an `X-Request-ID` header. Clients can send their own
+`X-Request-ID` value, or the API will generate one automatically. The same value
+is included in structured logs to make debugging easier.
+
 Health check:
 
 ```bash
@@ -297,13 +313,15 @@ from Git history.
 The API logs structured events for the important paths:
 
 - `rag_question_answered`: question length, source count, retrieval time, LLM
-  time, and total request time.
+  time, total request time, and request ID.
 - `rag_index_rebuilt`: PDF count, loaded pages, generated chunks, and indexing
-  time.
+  time, plus request ID when triggered through the API.
 - `rag_document_uploaded`: saved filename, upload size, resulting PDF count,
-  chunk count, and total upload/index time.
+  chunk count, total upload/index time, and request ID.
 - `rag_rate_limited`: client key, configured limit, window size, and retry delay
-  when a request receives HTTP 429.
+  when a request receives HTTP 429, plus request ID.
+- `http_request_completed`: method, path, status code, elapsed time, and request
+  ID for every API request.
 
 Use `LOG_LEVEL=INFO` locally or in deployment to keep these metrics visible.
 
