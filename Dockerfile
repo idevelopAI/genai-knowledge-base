@@ -4,11 +4,12 @@ FROM python:3.11-slim
 # 2.Arbeitsordner im Container setzen
 WORKDIR /app
 
-# 3.  ERST die requirements.txt kopieren
+# 3.  ERST die requirements-Dateien kopieren
 COPY requirements.txt .
+COPY requirements.lock.txt .
 
 # 4. Abhängigkeiten installieren
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.lock.txt
 
 # 5. Den kompletten restlichen Code (inkl. chroma_db) in den Container kopieren
 COPY . .

@@ -1,5 +1,7 @@
 # End-to-End GenAI Knowledge Base (RAG)
 
+[![CI](https://github.com/idevelopAI/genai-knowledge-base/actions/workflows/ci.yml/badge.svg)](https://github.com/idevelopAI/genai-knowledge-base/actions/workflows/ci.yml)
+
 A containerized Retrieval-Augmented Generation system for asking questions over
 internal PDF documents. The project combines a FastAPI backend, LangChain,
 ChromaDB, Google Gemini models, and a Streamlit chat UI.
@@ -35,6 +37,19 @@ PDF documents
 - Frontend: Streamlit
 - DevOps: Docker, GitHub Actions
 - Infrastructure: Terraform for an Azure deployment draft
+
+## Tradeoffs
+
+- ChromaDB keeps the prototype simple: it runs locally, persists embeddings on
+  disk, and avoids external database setup while still showing real vector
+  retrieval behavior.
+- Google Gemini is used for both embeddings and answer generation to keep the
+  model stack consistent and easy to configure through environment variables.
+- In production, the vector store should move to managed infrastructure with
+  backups, access controls, monitoring, and a clear migration path for schema or
+  embedding-model changes.
+- Local vector storage is convenient for demos, but it does not solve multi-user
+  concurrency, centralized persistence, auditability, or horizontal scaling.
 
 ## Features
 
@@ -79,8 +94,11 @@ Create a virtual environment and install dependencies:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.lock.txt
 ```
+
+`requirements.txt` lists the direct project dependencies. `requirements.lock.txt`
+pins the full resolved dependency set used by CI and Docker for reproducibility.
 
 Create a local `.env` file from the safe example file, then add your real API
 key only in your local `.env` file:
