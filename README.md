@@ -10,6 +10,10 @@ The goal is to demonstrate a practical AI engineering workflow: document
 ingestion, vector search, grounded answer generation, API design, Docker-based
 packaging, CI checks, and an Azure Terraform infrastructure draft.
 
+The README and engineering notes are written in English for portfolio review.
+The Streamlit UI and sample questions use German because the included sample
+documents and demo workflow are German-focused.
+
 ## Why This Project Matters
 
 Companies often have useful information locked inside PDFs, manuals, policies,
@@ -19,15 +23,23 @@ context-grounded answers with source references.
 
 ## Architecture
 
-```text
-PDF documents
-    -> LangChain PDF loader
-    -> Recursive text chunking
-    -> Gemini embeddings
-    -> ChromaDB vector store
-    -> FastAPI /ask endpoint
-    -> Gemini chat model
-    -> Streamlit chat UI with sources
+```mermaid
+flowchart LR
+    PDFs["PDF documents"] --> Loader["LangChain PDF loader"]
+    Loader --> Splitter["Recursive text splitter"]
+    Splitter --> Embeddings["Gemini embeddings"]
+    Embeddings --> Chroma["ChromaDB vector store"]
+
+    User["User in Streamlit UI"] --> API["FastAPI backend"]
+    API --> Retriever["Retriever top-k chunks"]
+    Retriever --> Chroma
+    Retriever --> Prompt["Grounded prompt with context"]
+    Prompt --> LLM["Gemini chat model"]
+    LLM --> Answer["Answer with source citations"]
+    Answer --> User
+
+    Upload["PDF upload / reindex"] --> API
+    API --> Loader
 ```
 
 ## Tech Stack
@@ -153,10 +165,12 @@ After starting the app, try this flow:
 
 1. Open `http://localhost:8501`.
 2. Confirm the sidebar lists the PDFs from `data/`.
-3. Ask: `Welche Informationen stehen im Dokument?`
-4. Expand `Quellen` under the answer and check the source filename/page.
-5. Upload another PDF from the sidebar, click `Hochladen und indexieren`, then
-   ask a question about the new document.
+3. Ask this German sample question: `Welche Informationen stehen im Dokument?`
+4. Expand the German `Quellen` section under the answer and check the source
+   filename/page.
+5. Upload another PDF from the sidebar, click the German
+   `Hochladen und indexieren` button, then ask a question about the new
+   document.
 6. Run `python evals/run_eval.py` while the backend is running to see the basic
    RAG quality checks.
 
@@ -222,7 +236,7 @@ Health check:
 curl http://127.0.0.1:8000/health
 ```
 
-Ask a question:
+Ask a German sample question:
 
 ```bash
 curl -X POST http://127.0.0.1:8000/ask \
