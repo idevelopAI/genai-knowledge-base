@@ -113,6 +113,38 @@ def test_ask_accepts_bearer_token_when_configured(monkeypatch):
     assert "GOOGLE_API_KEY" in response.json()["detail"]
 
 
+def test_ask_rejects_blank_question():
+    response = client.post("/ask", json={"question": "   "})
+
+    assert response.status_code == 422
+
+
+def test_ask_rejects_question_over_length_limit():
+    response = client.post(
+        "/ask",
+        json={"question": "x" * (main.MAX_QUESTION_LENGTH + 1)},
+    )
+
+    assert response.status_code == 422
+
+
+def test_ask_returns_without_llm_call_when_retrieval_has_no_context(monkeypatch):
+    class EmptyRetriever:
+        def invoke(self, question):
+            return [Document(page_content="   ", metadata={})]
+
+    monkeypatch.setattr(main, "retriever", EmptyRetriever())
+    monkeypatch.setattr(main, "llm", object())
+
+    response = client.post("/ask", json={"question": "Unknown topic"})
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "answer": main.NO_CONTEXT_ANSWER,
+        "sources": [],
+    }
+
+
 def test_list_documents_returns_pdf_names(tmp_path, monkeypatch):
     (tmp_path / "sample.pdf").write_bytes(b"%PDF-1.4\n")
     (tmp_path / "notes.txt").write_text("not a pdf")
@@ -400,6 +432,28 @@ def test_format_docs_adds_source_labels():
 
     assert "[Source 1: sample_document.pdf, page 2]" in formatted
     assert "Document context" in formatted
+
+
+def test_prepare_retrieved_documents_removes_empty_and_exact_duplicates():
+    duplicate = Document(
+        page_content="Document context",
+        metadata={"source": "data/sample_document.pdf", "page": 1},
+    )
+    unique = Document(
+        page_content="Other context",
+        metadata={"source": "data/sample_document.pdf", "page": 2},
+    )
+
+    prepared = main.prepare_retrieved_documents(
+        [duplicate, duplicate, Document(page_content=" ", metadata={}), unique]
+    )
+
+    assert prepared == [duplicate, unique]
+
+
+def test_system_prompt_treats_document_context_as_untrusted_and_requires_sources():
+    assert "nicht vertrauenswuerdigen Dokumentdaten" in main.system_prompt
+    assert "[Source N]" in main.system_prompt
 
 
 def test_sanitize_filename_removes_path_and_unsafe_characters():

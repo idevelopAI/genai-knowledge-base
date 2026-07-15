@@ -20,7 +20,7 @@ def test_live_eval_checks_answers_sources_and_excerpts():
         "expected_excerpt_contains_any": ["aerifizieren"],
     }
     payload = {
-        "answer": "Danach wird Quarzsand verteilt.",
+        "answer": "Danach wird Quarzsand verteilt [Source 1].",
         "sources": [
             {
                 "source": "garden-guide.pdf",
@@ -50,6 +50,29 @@ def test_live_eval_reports_missing_quality_expectations():
 
     assert passed is False
     assert len(failures) == 4
+
+
+def test_live_eval_requires_inline_citations_when_configured():
+    passed, failures = score_live_case(
+        {"require_citations": True},
+        {"answer": "Antwort ohne Quellenverweis.", "sources": []},
+    )
+
+    assert passed is False
+    assert failures == ["expected an inline [Source N] citation"]
+
+
+def test_live_eval_rejects_citation_to_unavailable_source():
+    passed, failures = score_live_case(
+        {"require_citations": True},
+        {
+            "answer": "Antwort [Source 2].",
+            "sources": [{"source": "guide.pdf", "excerpt": "Context"}],
+        },
+    )
+
+    assert passed is False
+    assert failures == ["inline citation references an unavailable source"]
 
 
 def test_committed_retrieval_cases_pass_without_external_services():

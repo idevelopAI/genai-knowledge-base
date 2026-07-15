@@ -1,5 +1,6 @@
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ UNKNOWN_MARKERS = [
     "i don't know",
     "not provided",
 ]
+CITATION_PATTERN = re.compile(r"\[Source (\d+)\]", re.IGNORECASE)
 
 
 def load_cases(path: Path) -> list[dict[str, Any]]:
@@ -78,6 +80,13 @@ def score_case(case: dict[str, Any], payload: dict[str, Any]) -> tuple[bool, lis
     if case.get("should_refuse"):
         if not any(marker in normalized_answer for marker in UNKNOWN_MARKERS):
             failures.append("expected refusal/unknown answer")
+
+    if case.get("require_citations"):
+        citations = [int(match) for match in CITATION_PATTERN.findall(answer)]
+        if not citations:
+            failures.append("expected an inline [Source N] citation")
+        elif any(citation < 1 or citation > len(sources) for citation in citations):
+            failures.append("inline citation references an unavailable source")
 
     return not failures, failures
 

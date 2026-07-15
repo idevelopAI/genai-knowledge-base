@@ -91,6 +91,10 @@ The sidebar supports document discovery, PDF upload, and manual reindexing:
 - Runs upload and reindex operations asynchronously with job-status polling.
 - Exposes a FastAPI `/ask` endpoint for RAG answers.
 - Returns source document names, page numbers, and excerpts with each answer.
+- Prompts grounded answers to include inline `[Source N]` evidence markers and
+  checks them in the live evaluation suite.
+- Refuses without calling the LLM when retrieval returns no usable context.
+- Treats retrieved document text as untrusted data in the system prompt.
 - Provides a Streamlit chat interface for interactive use.
 - Includes deterministic retrieval smoke checks and live RAG evaluation cases.
 - Includes Docker packaging and a GitHub Actions CI workflow.
@@ -262,7 +266,8 @@ python evals/run_eval.py
 ```
 
 The live runner reads `evals/questions.jsonl`, sends each question to `/ask`,
-and checks answer terms, source names, source excerpts, and refusal behavior.
+and checks answer terms, source names, source excerpts, refusal behavior, and
+inline `[Source N]` citations for grounded-answer cases.
 
 ## API
 
@@ -365,6 +370,10 @@ Example `/ask` response shape:
 - Index rebuilds activate a new version only after embedding succeeds; the
   previous collection remains active on failure.
 - API errors avoid returning raw internal exception text to users.
+- Questions are trimmed, reject blank input, and are limited to 2,000
+  characters.
+- Retrieved document instructions are explicitly treated as untrusted data;
+  empty retrieval results return a deterministic refusal without an LLM call.
 - Bearer tokens are compared in constant time and represented only by a hashed
   fingerprint in rate-limiter state and logs.
 
