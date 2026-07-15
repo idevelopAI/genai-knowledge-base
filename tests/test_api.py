@@ -55,6 +55,7 @@ def test_health_is_available_without_api_key():
     payload = response.json()
     assert payload["status"] == "ok"
     assert payload["rag_ready"] is False
+    assert payload["min_relevance_score"] == main.RAG_MIN_RELEVANCE_SCORE
     assert "pdf_count" in payload
 
 
@@ -130,8 +131,12 @@ def test_ask_rejects_question_over_length_limit():
 
 def test_ask_returns_without_llm_call_when_retrieval_has_no_context(monkeypatch):
     class EmptyRetriever:
-        def invoke(self, question):
-            return [Document(page_content="   ", metadata={})]
+        def retrieve(self, question):
+            return main.RetrievalResult(
+                documents=[],
+                candidate_count=1,
+                best_candidate_score=0.12,
+            )
 
     monkeypatch.setattr(main, "retriever", EmptyRetriever())
     monkeypatch.setattr(main, "llm", object())
@@ -143,6 +148,58 @@ def test_ask_returns_without_llm_call_when_retrieval_has_no_context(monkeypatch)
         "answer": main.NO_CONTEXT_ANSWER,
         "sources": [],
     }
+
+
+def test_relevance_filter_keeps_only_scored_usable_documents():
+    relevant = Document(
+        page_content="Relevant context",
+        metadata={"source": "guide.pdf", "page": 0},
+    )
+    irrelevant = Document(
+        page_content="Irrelevant context",
+        metadata={"source": "other.pdf", "page": 0},
+    )
+
+    class ScoredVectorStore:
+        def similarity_search_with_relevance_scores(self, question, k):
+            assert question == "test question"
+            assert k == 3
+            return [
+                (relevant, 0.81),
+                (irrelevant, 0.44),
+                (Document(page_content="  ", metadata={}), 0.9),
+            ]
+
+    retriever = main.RelevanceFilteringRetriever(
+        ScoredVectorStore(),
+        top_k=3,
+        min_score=0.45,
+    )
+
+    result = retriever.retrieve("test question")
+
+    assert result.documents == [relevant]
+    assert result.candidate_count == 3
+    assert result.best_candidate_score == 0.9
+
+
+def test_relevance_filter_rejects_non_finite_scores():
+    document = Document(page_content="Context", metadata={})
+
+    class InvalidScoreVectorStore:
+        def similarity_search_with_relevance_scores(self, question, k):
+            return [(document, float("nan")), (document, 1.2)]
+
+    retriever = main.RelevanceFilteringRetriever(
+        InvalidScoreVectorStore(),
+        top_k=1,
+        min_score=0,
+    )
+
+    result = retriever.retrieve("test")
+
+    assert result.documents == []
+    assert result.best_candidate_score is None
 
 
 def test_list_documents_returns_pdf_names(tmp_path, monkeypatch):

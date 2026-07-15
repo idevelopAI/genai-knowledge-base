@@ -185,6 +185,7 @@ def build_vector_db(
         embedding=embeddings,
         persist_directory=persist_directory,
         collection_name=versioned_collection_name,
+        collection_configuration={"hnsw": {"space": "cosine"}},
     )
     set_active_collection_name(persist_directory, versioned_collection_name)
 

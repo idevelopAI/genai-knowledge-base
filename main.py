@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import logging
+import math
 import os
 import re
 import threading
@@ -8,6 +9,7 @@ import time
 import uuid
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -73,12 +75,30 @@ def _non_negative_int_from_env(name: str, default: int) -> int:
     return max(0, value)
 
 
+def _unit_float_from_env(name: str, default: float) -> float:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+
+    try:
+        value = float(raw_value)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %s", name, raw_value, default)
+        return default
+
+    if not math.isfinite(value) or not 0 <= value <= 1:
+        logger.warning("Invalid %s=%r; using %s", name, raw_value, default)
+        return default
+    return value
+
+
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 RAG_API_TOKEN = os.environ.get("RAG_API_TOKEN")
 DATA_DIR = os.environ.get("DATA_DIR", "./data")
 CHROMA_DB_DIR = os.environ.get("CHROMA_DB_DIR", "./chroma_db")
 CHROMA_COLLECTION_NAME = os.environ.get("CHROMA_COLLECTION_NAME", "langchain")
 RAG_TOP_K = _positive_int_from_env("RAG_TOP_K", 3)
+RAG_MIN_RELEVANCE_SCORE = _unit_float_from_env("RAG_MIN_RELEVANCE_SCORE", 0.45)
 RAG_CHUNK_SIZE = _positive_int_from_env("RAG_CHUNK_SIZE", 1000)
 RAG_CHUNK_OVERLAP = _positive_int_from_env("RAG_CHUNK_OVERLAP", 200)
 RAG_MAX_UPLOAD_BYTES = _positive_int_from_env(
@@ -156,6 +176,42 @@ class IndexJobResponse(BaseModel):
     filename: str | None = None
     result: IndexResponse | None = None
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class RetrievalResult:
+    documents: list[Document]
+    candidate_count: int
+    best_candidate_score: float | None
+
+
+class RelevanceFilteringRetriever:
+    def __init__(self, vectorstore: Chroma, top_k: int, min_score: float) -> None:
+        self.vectorstore = vectorstore
+        self.top_k = top_k
+        self.min_score = min_score
+
+    def retrieve(self, question: str) -> RetrievalResult:
+        candidates = self.vectorstore.similarity_search_with_relevance_scores(
+            question,
+            k=self.top_k,
+        )
+        valid_scores = [
+            score
+            for _, score in candidates
+            if math.isfinite(score) and 0 <= score <= 1
+        ]
+        accepted = [
+            (doc, score)
+            for doc, score in candidates
+            if math.isfinite(score) and self.min_score <= score <= 1
+        ]
+        documents = prepare_retrieved_documents([doc for doc, _ in accepted])
+        return RetrievalResult(
+            documents=documents,
+            candidate_count=len(candidates),
+            best_candidate_score=max(valid_scores, default=None),
+        )
 
 
 def _elapsed_ms(start_time: float) -> int:
@@ -295,7 +351,11 @@ def _build_rag_components() -> tuple[Any | None, Any | None]:
         persist_directory=CHROMA_DB_DIR,
         embedding_function=embeddings,
     )
-    retriever = vectorstore.as_retriever(search_kwargs={"k": RAG_TOP_K})
+    retriever = RelevanceFilteringRetriever(
+        vectorstore,
+        top_k=RAG_TOP_K,
+        min_score=RAG_MIN_RELEVANCE_SCORE,
+    )
     llm = ChatGoogleGenerativeAI(
         model=GEMINI_CHAT_MODEL,
         temperature=0,
@@ -583,11 +643,12 @@ def _submit_index_job(
 
 
 @app.get("/health")
-async def health() -> dict[str, bool | str | int]:
+async def health() -> dict[str, bool | str | int | float]:
     return {
         "status": "ok",
         "rag_ready": retriever is not None and llm is not None,
         "top_k": RAG_TOP_K,
+        "min_relevance_score": RAG_MIN_RELEVANCE_SCORE,
         "data_dir": DATA_DIR,
         "vector_store": CHROMA_DB_DIR,
         "pdf_count": len(list_pdf_files(DATA_DIR)),
@@ -694,16 +755,21 @@ async def ask_question(query: QueryRequest, request: Request) -> QueryResponse:
 
     try:
         retrieval_start = time.perf_counter()
-        docs = prepare_retrieved_documents(retriever.invoke(query.question))
+        retrieval = retriever.retrieve(query.question)
+        docs = retrieval.documents
         retrieval_ms = _elapsed_ms(retrieval_start)
 
         if not docs:
             total_ms = _elapsed_ms(request_start)
             logger.info(
                 "rag_question_answered status=no_context request_id=%s "
-                "question_chars=%s sources=0 retrieval_ms=%s llm_ms=0 total_ms=%s",
+                "question_chars=%s candidates=%s sources=0 min_score=%s "
+                "best_score=%s retrieval_ms=%s llm_ms=0 total_ms=%s",
                 _request_id(request),
                 len(query.question),
+                retrieval.candidate_count,
+                RAG_MIN_RELEVANCE_SCORE,
+                retrieval.best_candidate_score,
                 retrieval_ms,
                 total_ms,
             )
@@ -721,10 +787,14 @@ async def ask_question(query: QueryRequest, request: Request) -> QueryResponse:
         total_ms = _elapsed_ms(request_start)
         logger.info(
             "rag_question_answered status=success request_id=%s question_chars=%s "
-            "sources=%s retrieval_ms=%s llm_ms=%s total_ms=%s",
+            "candidates=%s sources=%s min_score=%s best_score=%s "
+            "retrieval_ms=%s llm_ms=%s total_ms=%s",
             _request_id(request),
             len(query.question),
+            retrieval.candidate_count,
             len(docs),
+            RAG_MIN_RELEVANCE_SCORE,
+            retrieval.best_candidate_score,
             retrieval_ms,
             llm_ms,
             total_ms,

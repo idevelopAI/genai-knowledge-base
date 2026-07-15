@@ -33,7 +33,8 @@ flowchart LR
     User["User in Streamlit UI"] --> API["FastAPI backend"]
     API --> Retriever["Retriever top-k chunks"]
     Retriever --> Chroma
-    Retriever --> Prompt["Grounded prompt with context"]
+    Retriever --> Filter["Minimum relevance score"]
+    Filter --> Prompt["Grounded prompt with context"]
     Prompt --> LLM["Gemini chat model"]
     LLM --> Answer["Answer with source citations"]
     Answer --> User
@@ -79,6 +80,9 @@ The sidebar supports document discovery, PDF upload, and manual reindexing:
   ingress-level rate limiter.
 - Index jobs run in a bounded, process-local worker queue. This keeps local
   requests responsive, but production deployments need a durable shared queue.
+- Relevance scores are retrieval heuristics, not calibrated confidence
+  probabilities. The cutoff should be tuned against representative evaluation
+  questions whenever the documents or embedding model change.
 
 ## Features
 
@@ -94,6 +98,8 @@ The sidebar supports document discovery, PDF upload, and manual reindexing:
 - Prompts grounded answers to include inline `[Source N]` evidence markers and
   checks them in the live evaluation suite.
 - Refuses without calling the LLM when retrieval returns no usable context.
+- Filters retrieved chunks by a configurable minimum relevance score and
+  refuses when none pass.
 - Treats retrieved document text as untrusted data in the system prompt.
 - Provides a Streamlit chat interface for interactive use.
 - Includes deterministic retrieval smoke checks and live RAG evaluation cases.
@@ -192,6 +198,9 @@ PDF uploads default to a 10 MiB file limit and a 200-page limit. Override them
 with `RAG_MAX_UPLOAD_BYTES` and `RAG_MAX_PDF_PAGES`.
 `RAG_MAX_INDEX_JOBS` controls the number of retained or active local jobs and
 defaults to 100.
+`RAG_MIN_RELEVANCE_SCORE` controls the `0..1` scored-retrieval cutoff and
+defaults to `0.45`. Reindex once after upgrading so the active collection uses
+cosine distance consistently.
 
 ## Demo Script
 
@@ -280,6 +289,10 @@ Authorization: Bearer <RAG_API_TOKEN>
 The expensive endpoints are rate-limited by default using
 `RAG_RATE_LIMIT_REQUESTS=60` per `RAG_RATE_LIMIT_WINDOW_SECONDS=60`. Set
 `RAG_RATE_LIMIT_REQUESTS=0` to disable this locally.
+
+`RAG_MIN_RELEVANCE_SCORE` filters the top `RAG_TOP_K` candidates before prompt
+construction. Higher values refuse more aggressively; calibrate the value with
+`python evals/run_eval.py` instead of treating it as model confidence.
 
 Every API response includes an `X-Request-ID` header. Clients can send their own
 `X-Request-ID` value, or the API will generate one automatically. The same value
@@ -374,6 +387,7 @@ Example `/ask` response shape:
   characters.
 - Retrieved document instructions are explicitly treated as untrusted data;
   empty retrieval results return a deterministic refusal without an LLM call.
+- Low-scoring retrieval results are excluded before prompt construction.
 - Bearer tokens are compared in constant time and represented only by a hashed
   fingerprint in rate-limiter state and logs.
 
@@ -384,8 +398,9 @@ from Git history.
 
 The API logs structured events for the important paths:
 
-- `rag_question_answered`: question length, source count, retrieval time, LLM
-  time, total request time, and request ID.
+- `rag_question_answered`: question length, candidate/source counts, relevance
+  threshold and best score, retrieval time, LLM time, total request time, and
+  request ID.
 - `rag_index_rebuilt`: PDF count, loaded pages, generated chunks, and indexing
   time, plus request ID when triggered through the API.
 - `rag_document_uploaded`: saved filename, upload size, page count, resulting

@@ -79,6 +79,7 @@ def test_successful_index_build_activates_versioned_collection(tmp_path, monkeyp
 
     assert stats.collection_name.startswith("documents-")
     assert captured["collection_name"] == stats.collection_name
+    assert captured["collection_configuration"] == {"hnsw": {"space": "cosine"}}
     assert (
         rag_index.get_active_collection_name(str(vector_dir), "fallback")
         == stats.collection_name
