@@ -6,11 +6,10 @@ A containerized Retrieval-Augmented Generation system for asking questions over
 internal PDF documents. The project combines a FastAPI backend, LangChain,
 ChromaDB, Google Gemini models, and a Streamlit chat UI.
 
-The goal is to demonstrate a practical AI engineering workflow: document
-ingestion, vector search, grounded answer generation, API design, Docker-based
-packaging, CI checks, and an Azure Terraform infrastructure draft.
+The system covers document ingestion, vector search, grounded answer
+generation, API access, Docker-based packaging, CI checks, and an Azure
+Terraform infrastructure draft.
 
-The README and engineering notes are written in English for portfolio review.
 The Streamlit UI and sample questions use German because the included sample
 documents and demo workflow are German-focused.
 
@@ -93,11 +92,11 @@ The sidebar supports document discovery, PDF upload, and manual reindexing:
 - Logs request timing, retrieval timing, LLM timing, and indexing metrics.
 - Keeps secrets out of tracked code and Docker build context.
 
-## Project Status
+## Current Scope
 
-This is an interview-ready RAG prototype, not a fully production-hardened
-enterprise system. It demonstrates the core architecture and engineering
-workflow, with clear next steps for production readiness.
+This repository provides a complete local RAG workflow. It is not yet intended
+for production workloads that require distributed storage, horizontal scaling,
+or managed cloud operations.
 
 Current hardening work includes:
 
@@ -344,10 +343,3 @@ and building the Docker image.
 The `terraform/` folder contains an Azure infrastructure draft for the future
 deployment path. Before production use, it should be extended with container
 image settings, secret management, managed identity, and deployment outputs.
-
-## Resume Bullet
-
-Built a Dockerized RAG knowledge base using FastAPI, LangChain, ChromaDB, Google
-Gemini, and Streamlit, with PDF upload/reindexing, source-cited answers,
-JSONL-driven eval checks, CI validation, and an Azure Terraform deployment
-draft.
