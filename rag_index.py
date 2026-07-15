@@ -1,11 +1,20 @@
+import io
 import re
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+import chromadb
+from chromadb.errors import NotFoundError
 from langchain_chroma import Chroma
 from langchain_community.document_loaders import PyPDFDirectoryLoader
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from pypdf import PdfReader
+from pypdf.errors import PdfReadError
+
+
+ACTIVE_COLLECTION_FILENAME = ".active_collection"
 
 
 @dataclass(frozen=True)
@@ -15,6 +24,7 @@ class IndexStats:
     chunks_created: int
     data_dir: str
     vector_store: str
+    collection_name: str
 
 
 def list_pdf_files(data_dir: str) -> list[Path]:
@@ -54,6 +64,61 @@ def save_pdf_bytes(data: bytes, filename: str, data_dir: str) -> Path:
     return destination
 
 
+def validate_pdf_bytes(data: bytes, max_pages: int) -> int:
+    if not data.startswith(b"%PDF-"):
+        raise ValueError("Uploaded file does not have a valid PDF signature.")
+
+    try:
+        reader = PdfReader(io.BytesIO(data))
+    except (PdfReadError, OSError, ValueError, EOFError) as exc:
+        raise ValueError("Uploaded file is not a readable PDF.") from exc
+
+    if reader.is_encrypted:
+        raise ValueError("Encrypted PDFs are not supported.")
+
+    try:
+        page_count = len(reader.pages)
+    except (PdfReadError, OSError, ValueError, EOFError) as exc:
+        raise ValueError("Uploaded file is not a readable PDF.") from exc
+
+    if page_count == 0:
+        raise ValueError("Uploaded PDF does not contain any pages.")
+    if page_count > max_pages:
+        raise ValueError(f"Uploaded PDF exceeds the {max_pages}-page limit.")
+    return page_count
+
+
+def get_active_collection_name(
+    persist_directory: str,
+    default_collection_name: str,
+) -> str:
+    pointer = Path(persist_directory) / ACTIVE_COLLECTION_FILENAME
+    try:
+        collection_name = pointer.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return default_collection_name
+    return collection_name or default_collection_name
+
+
+def set_active_collection_name(persist_directory: str, collection_name: str) -> None:
+    directory = Path(persist_directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    pointer = directory / ACTIVE_COLLECTION_FILENAME
+    temporary_pointer = directory / (
+        f"{ACTIVE_COLLECTION_FILENAME}.{uuid.uuid4().hex}.tmp"
+    )
+    temporary_pointer.write_text(collection_name, encoding="utf-8")
+    temporary_pointer.replace(pointer)
+
+
+def delete_collection(persist_directory: str, collection_name: str) -> None:
+    client = chromadb.PersistentClient(path=persist_directory)
+    try:
+        client.delete_collection(name=collection_name)
+    except NotFoundError:
+        return
+
+
 def build_vector_db(
     *,
     data_dir: str,
@@ -63,7 +128,6 @@ def build_vector_db(
     collection_name: str = "langchain",
     chunk_size: int = 1000,
     chunk_overlap: int = 200,
-    reset_collection: bool = True,
 ) -> IndexStats:
     pdf_files = list_pdf_files(data_dir)
     if not pdf_files:
@@ -85,20 +149,14 @@ def build_vector_db(
         google_api_key=google_api_key,
     )
 
-    if reset_collection:
-        existing_store = Chroma(
-            collection_name=collection_name,
-            persist_directory=persist_directory,
-            embedding_function=embeddings,
-        )
-        existing_store.delete_collection()
-
+    versioned_collection_name = f"{collection_name}-{uuid.uuid4().hex}"
     Chroma.from_documents(
         documents=splits,
         embedding=embeddings,
         persist_directory=persist_directory,
-        collection_name=collection_name,
+        collection_name=versioned_collection_name,
     )
+    set_active_collection_name(persist_directory, versioned_collection_name)
 
     return IndexStats(
         pdf_count=len(pdf_files),
@@ -106,4 +164,5 @@ def build_vector_db(
         chunks_created=len(splits),
         data_dir=data_dir,
         vector_store=persist_directory,
+        collection_name=versioned_collection_name,
     )

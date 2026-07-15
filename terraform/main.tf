@@ -1,4 +1,3 @@
-# 1. definiere Azure als mein Cloud-Provider
 terraform {
   required_providers {
     azurerm = {
@@ -12,22 +11,19 @@ provider "azurerm" {
   features {}
 }
 
-# 2. Ressourcengruppe (Der logische Ordner in der Cloud)
 resource "azurerm_resource_group" "rg" {
   name     = "rag-knowledge-base-rg"
   location = "West Europe"
 }
 
-# 3. Container Registry (Der private Hafen für mein fertiges Docker-Image)
 resource "azurerm_container_registry" "acr" {
-  name                = "ragknowledgebaseacr" # Muss weltweit einzigartig sein
+  name                = "ragknowledgebaseacr"
   resource_group_name = azurerm_resource_group.rg.name
   location            = azurerm_resource_group.rg.location
   sku                 = "Basic"
   admin_enabled       = true
 }
 
-# 4. App Service Plan (Der eigentliche Server/die CPU)
 resource "azurerm_service_plan" "app_plan" {
   name                = "rag-app-plan"
   location            = azurerm_resource_group.rg.location
@@ -36,7 +32,6 @@ resource "azurerm_service_plan" "app_plan" {
   sku_name            = "B1"
 }
 
-# 5. Web App (Hier läuft am Ende mein Docker-Container)
 resource "azurerm_linux_web_app" "app" {
   name                = "rag-knowledge-base-app"
   location            = azurerm_resource_group.rg.location

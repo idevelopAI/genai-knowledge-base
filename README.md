@@ -79,7 +79,10 @@ The sidebar supports document discovery, PDF upload, and manual reindexing:
 
 - Ingests PDFs from the local `data/` folder.
 - Supports PDF upload and reindexing from the Streamlit UI.
+- Validates PDF structure and enforces configurable file-size and page limits.
 - Stores document chunks in a local ChromaDB vector database.
+- Rebuilds indexes through versioned collections so a failed build does not
+  replace the active index.
 - Exposes a FastAPI `/ask` endpoint for RAG answers.
 - Returns source document names, page numbers, and excerpts with each answer.
 - Provides a Streamlit chat interface for interactive use.
@@ -111,6 +114,8 @@ Current hardening work includes:
 - Configurable in-memory rate limiting.
 - Structured observability logs for RAG and indexing paths.
 - Request IDs for correlating client errors, server logs, and API responses.
+- Transactional index activation and upload rollback on indexing failure.
+- Bounded, parser-validated PDF uploads and concurrent rebuild protection.
 
 Planned improvements:
 
@@ -170,6 +175,9 @@ streamlit run frontend.py
 The Streamlit sidebar lets you upload a PDF, rebuild the index, and see the
 documents currently available to the backend.
 
+PDF uploads default to a 10 MiB file limit and a 200-page limit. Override them
+with `RAG_MAX_UPLOAD_BYTES` and `RAG_MAX_PDF_PAGES`.
+
 ## Demo Script
 
 After starting the app, try this flow:
@@ -192,6 +200,10 @@ Run both the backend and frontend with Docker Compose:
 ```bash
 docker compose up --build
 ```
+
+Compose passes the complete local environment only to the backend. The
+frontend receives the backend URLs and optional `RAG_API_TOKEN`, but not the
+Gemini API key.
 
 Then open:
 
@@ -302,6 +314,10 @@ Example response shape:
   and `/reindex`.
 - `RAG_RATE_LIMIT_REQUESTS` and `RAG_RATE_LIMIT_WINDOW_SECONDS` limit repeated
   calls to `/ask`, `/documents`, and `/reindex`.
+- `RAG_MAX_UPLOAD_BYTES` and `RAG_MAX_PDF_PAGES` bound uploaded PDF processing.
+- Uploaded files are parser-validated and removed if indexing fails.
+- Index rebuilds activate a new version only after embedding succeeds; the
+  previous collection remains active on failure.
 - API errors avoid returning raw internal exception text to users.
 - Bearer tokens are compared in constant time and represented only by a hashed
   fingerprint in rate-limiter state and logs.
@@ -317,8 +333,8 @@ The API logs structured events for the important paths:
   time, total request time, and request ID.
 - `rag_index_rebuilt`: PDF count, loaded pages, generated chunks, and indexing
   time, plus request ID when triggered through the API.
-- `rag_document_uploaded`: saved filename, upload size, resulting PDF count,
-  chunk count, total upload/index time, and request ID.
+- `rag_document_uploaded`: saved filename, upload size, page count, resulting
+  PDF count, chunk count, total upload/index time, and request ID.
 - `rag_rate_limited`: client key, configured limit, window size, and retry delay
   when a request receives HTTP 429, plus request ID.
 - `http_request_completed`: method, path, status code, elapsed time, and request

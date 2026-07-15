@@ -2,6 +2,8 @@ import hashlib
 import hmac
 import logging
 import os
+import re
+import threading
 import time
 import uuid
 from collections import defaultdict, deque
@@ -16,7 +18,16 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from pydantic import BaseModel, Field
 
-from rag_index import IndexStats, build_vector_db, list_pdf_files, save_pdf_bytes
+from rag_index import (
+    IndexStats,
+    build_vector_db,
+    delete_collection,
+    get_active_collection_name,
+    list_pdf_files,
+    save_pdf_bytes,
+    set_active_collection_name,
+    validate_pdf_bytes,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -59,6 +70,11 @@ CHROMA_COLLECTION_NAME = os.environ.get("CHROMA_COLLECTION_NAME", "langchain")
 RAG_TOP_K = _positive_int_from_env("RAG_TOP_K", 3)
 RAG_CHUNK_SIZE = _positive_int_from_env("RAG_CHUNK_SIZE", 1000)
 RAG_CHUNK_OVERLAP = _positive_int_from_env("RAG_CHUNK_OVERLAP", 200)
+RAG_MAX_UPLOAD_BYTES = _positive_int_from_env(
+    "RAG_MAX_UPLOAD_BYTES",
+    10 * 1024 * 1024,
+)
+RAG_MAX_PDF_PAGES = _positive_int_from_env("RAG_MAX_PDF_PAGES", 200)
 RAG_RATE_LIMIT_REQUESTS = _non_negative_int_from_env("RAG_RATE_LIMIT_REQUESTS", 60)
 RAG_RATE_LIMIT_WINDOW_SECONDS = _positive_int_from_env(
     "RAG_RATE_LIMIT_WINDOW_SECONDS", 60
@@ -68,9 +84,11 @@ GEMINI_EMBEDDING_MODEL = os.environ.get(
 )
 GEMINI_CHAT_MODEL = os.environ.get("GEMINI_CHAT_MODEL", "gemini-3.5-flash")
 REQUEST_ID_HEADER = "X-Request-ID"
+REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 
 app = FastAPI(title="GenAI Knowledge Base API")
 rate_limit_events: defaultdict[str, deque[float]] = defaultdict(deque)
+index_rebuild_lock = threading.Lock()
 
 
 class QueryRequest(BaseModel):
@@ -115,9 +133,15 @@ def _request_id(request: Request | None) -> str:
     return getattr(request.state, "request_id", "unknown")
 
 
+def _normalized_request_id(value: str | None) -> str:
+    if value and REQUEST_ID_PATTERN.fullmatch(value):
+        return value
+    return str(uuid.uuid4())
+
+
 @app.middleware("http")
 async def add_request_id(request: Request, call_next):
-    request_id = request.headers.get(REQUEST_ID_HEADER) or str(uuid.uuid4())
+    request_id = _normalized_request_id(request.headers.get(REQUEST_ID_HEADER))
     request.state.request_id = request_id
     start_time = time.perf_counter()
 
@@ -223,8 +247,12 @@ def _build_rag_components() -> tuple[Any | None, Any | None]:
         model=GEMINI_EMBEDDING_MODEL,
         google_api_key=GOOGLE_API_KEY,
     )
+    active_collection_name = get_active_collection_name(
+        CHROMA_DB_DIR,
+        CHROMA_COLLECTION_NAME,
+    )
     vectorstore = Chroma(
-        collection_name=CHROMA_COLLECTION_NAME,
+        collection_name=active_collection_name,
         persist_directory=CHROMA_DB_DIR,
         embedding_function=embeddings,
     )
@@ -267,10 +295,20 @@ def _reload_rag_components() -> None:
 
 def _rebuild_vector_store(request: Request | None = None) -> IndexStats:
     google_api_key = _require_google_api_key()
+    if not index_rebuild_lock.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409,
+            detail="Another index rebuild is already running.",
+        )
+
     start_time = time.perf_counter()
     request_id = _request_id(request)
 
     try:
+        previous_collection_name = get_active_collection_name(
+            CHROMA_DB_DIR,
+            CHROMA_COLLECTION_NAME,
+        )
         stats = build_vector_db(
             data_dir=DATA_DIR,
             persist_directory=CHROMA_DB_DIR,
@@ -280,7 +318,21 @@ def _rebuild_vector_store(request: Request | None = None) -> IndexStats:
             chunk_size=RAG_CHUNK_SIZE,
             chunk_overlap=RAG_CHUNK_OVERLAP,
         )
-        _reload_rag_components()
+        try:
+            _reload_rag_components()
+        except Exception:
+            set_active_collection_name(CHROMA_DB_DIR, previous_collection_name)
+            raise
+
+        if previous_collection_name != stats.collection_name:
+            try:
+                delete_collection(CHROMA_DB_DIR, previous_collection_name)
+            except Exception:
+                logger.warning(
+                    "rag_index_cleanup_failed request_id=%s collection=%s",
+                    request_id,
+                    previous_collection_name,
+                )
         logger.info(
             "rag_index_rebuilt status=success request_id=%s pdf_count=%s "
             "pages_loaded=%s chunks_created=%s elapsed_ms=%s",
@@ -310,6 +362,8 @@ def _rebuild_vector_store(request: Request | None = None) -> IndexStats:
             status_code=500,
             detail="Unable to rebuild the vector store right now.",
         )
+    finally:
+        index_rebuild_lock.release()
 
 
 def _source_label(metadata: dict[str, Any]) -> str:
@@ -403,19 +457,42 @@ async def upload_document(
     if not filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF uploads are supported.")
 
-    _require_google_api_key()
-    contents = await file.read()
+    contents = await file.read(RAG_MAX_UPLOAD_BYTES + 1)
     if not contents:
         raise HTTPException(status_code=400, detail="Uploaded PDF is empty.")
+    if len(contents) > RAG_MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Uploaded PDF exceeds the {RAG_MAX_UPLOAD_BYTES}-byte limit.",
+        )
+
+    try:
+        page_count = validate_pdf_bytes(contents, RAG_MAX_PDF_PAGES)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    _require_google_api_key()
 
     saved_path = save_pdf_bytes(contents, filename, DATA_DIR)
-    stats = _rebuild_vector_store(request)
+    try:
+        stats = _rebuild_vector_store(request)
+    except Exception:
+        try:
+            saved_path.unlink(missing_ok=True)
+        except OSError:
+            logger.exception(
+                "rag_upload_rollback_failed request_id=%s filename=%s",
+                _request_id(request),
+                saved_path.name,
+            )
+        raise
     logger.info(
-        "rag_document_uploaded request_id=%s filename=%s bytes=%s pdf_count=%s "
-        "chunks_created=%s elapsed_ms=%s",
+        "rag_document_uploaded request_id=%s filename=%s bytes=%s pages=%s "
+        "pdf_count=%s chunks_created=%s elapsed_ms=%s",
         _request_id(request),
         saved_path.name,
         len(contents),
+        page_count,
         stats.pdf_count,
         stats.chunks_created,
         _elapsed_ms(start_time),

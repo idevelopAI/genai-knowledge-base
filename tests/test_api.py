@@ -1,8 +1,17 @@
+from io import BytesIO
 import os
 
+import pytest
 from fastapi.testclient import TestClient
 from langchain_core.documents import Document
-from rag_index import sanitize_filename, save_pdf_bytes
+from pypdf import PdfWriter
+from rag_index import (
+    IndexStats,
+    get_active_collection_name,
+    sanitize_filename,
+    save_pdf_bytes,
+    set_active_collection_name,
+)
 
 
 os.environ.pop("GOOGLE_API_KEY", None)
@@ -11,6 +20,15 @@ import main  # noqa: E402
 
 
 client = TestClient(main.app)
+
+
+def make_pdf_bytes(page_count: int = 1) -> bytes:
+    output = BytesIO()
+    writer = PdfWriter()
+    for _ in range(page_count):
+        writer.add_blank_page(width=612, height=792)
+    writer.write(output)
+    return output.getvalue()
 
 
 def setup_function():
@@ -39,6 +57,13 @@ def test_request_id_header_is_preserved():
 
     assert response.status_code == 200
     assert response.headers["X-Request-ID"] == "demo-request-123"
+
+
+def test_invalid_request_id_is_replaced():
+    response = client.get("/health", headers={"X-Request-ID": "invalid\nvalue"})
+
+    assert response.status_code == 200
+    assert response.headers["X-Request-ID"] != "invalid\nvalue"
 
 
 def test_ask_returns_503_when_rag_is_not_configured(monkeypatch):
@@ -152,11 +177,111 @@ def test_upload_pdf_requires_configured_key(monkeypatch):
 
     response = client.post(
         "/documents",
-        files={"file": ("sample.pdf", b"%PDF-1.4\n", "application/pdf")},
+        files={"file": ("sample.pdf", make_pdf_bytes(), "application/pdf")},
     )
 
     assert response.status_code == 503
     assert "GOOGLE_API_KEY" in response.json()["detail"]
+
+
+def test_upload_rejects_invalid_pdf_contents():
+    response = client.post(
+        "/documents",
+        files={"file": ("sample.pdf", b"not-a-pdf", "application/pdf")},
+    )
+
+    assert response.status_code == 400
+    assert "signature" in response.json()["detail"]
+
+
+def test_upload_rejects_files_over_size_limit(monkeypatch):
+    monkeypatch.setattr(main, "RAG_MAX_UPLOAD_BYTES", 8)
+
+    response = client.post(
+        "/documents",
+        files={"file": ("sample.pdf", make_pdf_bytes(), "application/pdf")},
+    )
+
+    assert response.status_code == 413
+
+
+def test_upload_rejects_pdf_over_page_limit(monkeypatch):
+    monkeypatch.setattr(main, "RAG_MAX_PDF_PAGES", 1)
+
+    response = client.post(
+        "/documents",
+        files={"file": ("sample.pdf", make_pdf_bytes(2), "application/pdf")},
+    )
+
+    assert response.status_code == 400
+    assert "page limit" in response.json()["detail"]
+
+
+def test_upload_removes_saved_file_when_indexing_fails(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "GOOGLE_API_KEY", "configured-for-test")
+    monkeypatch.setattr(main, "DATA_DIR", str(tmp_path))
+
+    def fail_rebuild(request):
+        raise main.HTTPException(status_code=500, detail="index failed")
+
+    monkeypatch.setattr(main, "_rebuild_vector_store", fail_rebuild)
+
+    response = client.post(
+        "/documents",
+        files={"file": ("sample.pdf", make_pdf_bytes(), "application/pdf")},
+    )
+
+    assert response.status_code == 500
+    assert list(tmp_path.glob("*.pdf")) == []
+
+
+def test_rebuild_rejects_concurrent_indexing(monkeypatch):
+    monkeypatch.setattr(main, "GOOGLE_API_KEY", "configured-for-test")
+    main.index_rebuild_lock.acquire()
+    try:
+        response = client.post("/reindex")
+    finally:
+        main.index_rebuild_lock.release()
+
+    assert response.status_code == 409
+
+
+def test_rebuild_restores_previous_collection_when_reload_fails(
+    tmp_path,
+    monkeypatch,
+):
+    vector_dir = tmp_path / "chroma"
+    set_active_collection_name(str(vector_dir), "existing-collection")
+    monkeypatch.setattr(main, "GOOGLE_API_KEY", "configured-for-test")
+    monkeypatch.setattr(main, "CHROMA_DB_DIR", str(vector_dir))
+    monkeypatch.setattr(main, "CHROMA_COLLECTION_NAME", "documents")
+
+    def build_new_collection(**kwargs):
+        set_active_collection_name(str(vector_dir), "new-collection")
+        return IndexStats(
+            pdf_count=1,
+            pages_loaded=1,
+            chunks_created=1,
+            data_dir="data",
+            vector_store=str(vector_dir),
+            collection_name="new-collection",
+        )
+
+    monkeypatch.setattr(main, "build_vector_db", build_new_collection)
+
+    def fail_reload():
+        raise RuntimeError("reload failed")
+
+    monkeypatch.setattr(main, "_reload_rag_components", fail_reload)
+
+    with pytest.raises(main.HTTPException) as exc_info:
+        main._rebuild_vector_store()
+
+    assert exc_info.value.status_code == 500
+    assert (
+        get_active_collection_name(str(vector_dir), "fallback")
+        == "existing-collection"
+    )
 
 
 def test_build_sources_uses_filename_and_one_based_page_number():

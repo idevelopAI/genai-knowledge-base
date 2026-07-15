@@ -11,12 +11,11 @@ services:
 
   frontend:
     build: .
-    env_file:
-      - .env
     environment:
       RAG_API_URL: http://backend:8000/ask
       RAG_DOCUMENTS_URL: http://backend:8000/documents
       RAG_REINDEX_URL: http://backend:8000/reindex
+      RAG_API_TOKEN: ${RAG_API_TOKEN:-}
     command: streamlit run frontend.py --server.address 0.0.0.0 --server.port 8501
     ports:
       - "8501:8501"
