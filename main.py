@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import logging
 import os
 import time
@@ -150,13 +152,14 @@ def _require_api_token(authorization: str | None = Header(default=None)) -> None
         return
 
     expected = f"Bearer {RAG_API_TOKEN}"
-    if authorization != expected:
+    if authorization is None or not hmac.compare_digest(authorization, expected):
         raise HTTPException(status_code=401, detail="Invalid or missing API token.")
 
 
 def _rate_limit_key(request: Request, authorization: str | None) -> str:
     if authorization:
-        return f"token:{authorization}"
+        fingerprint = hashlib.sha256(authorization.encode("utf-8")).hexdigest()[:12]
+        return f"token:{fingerprint}"
     if request.client and request.client.host:
         return f"ip:{request.client.host}"
     return "ip:unknown"

@@ -303,6 +303,8 @@ Example response shape:
 - `RAG_RATE_LIMIT_REQUESTS` and `RAG_RATE_LIMIT_WINDOW_SECONDS` limit repeated
   calls to `/ask`, `/documents`, and `/reindex`.
 - API errors avoid returning raw internal exception text to users.
+- Bearer tokens are compared in constant time and represented only by a hashed
+  fingerprint in rate-limiter state and logs.
 
 If a real API key is ever committed, rotate the key immediately and remove it
 from Git history.

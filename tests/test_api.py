@@ -120,6 +120,23 @@ def test_rate_limit_can_be_disabled(monkeypatch):
     assert second_response.status_code == 200
 
 
+def test_rate_limit_does_not_store_or_log_bearer_token(monkeypatch, caplog):
+    token = "private-test-token"
+    monkeypatch.setattr(main, "RAG_API_TOKEN", token)
+    monkeypatch.setattr(main, "RAG_RATE_LIMIT_REQUESTS", 1)
+    monkeypatch.setattr(main, "RAG_RATE_LIMIT_WINDOW_SECONDS", 60)
+    main.rate_limit_events.clear()
+    headers = {"Authorization": f"Bearer {token}"}
+
+    first_response = client.get("/documents", headers=headers)
+    second_response = client.get("/documents", headers=headers)
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 429
+    assert token not in " ".join(main.rate_limit_events)
+    assert token not in caplog.text
+
+
 def test_upload_rejects_non_pdf_files():
     response = client.post(
         "/documents",
