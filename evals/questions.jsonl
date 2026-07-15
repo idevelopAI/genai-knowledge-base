@@ -1,3 +1,6 @@
-{"id": "source-citation-basic", "question": "Welche Informationen stehen im Dokument?", "min_sources": 1}
-{"id": "garden-guide-source", "question": "Welches Dokument enthaelt Informationen zur Gartenpflege?", "expected_source_contains": "Gartenpflege", "min_sources": 1}
+{"id": "garden-aeration", "question": "Was soll nach dem Aerifizieren auf dem Rasen verteilt werden?", "expected_source_contains": "Gartenpflege", "expected_answer_contains_any": ["Quarzsand", "Sand"], "expected_excerpt_contains_any": ["Quarzsand", "besandet"], "min_sources": 1}
+{"id": "garden-irrigation", "question": "Wie reduzieren moderne Bewaesserungssysteme den Wasserverbrauch?", "expected_source_contains": "Gartenpflege", "expected_answer_contains_any": ["Tropfrohr", "Versenkregner", "Verdunstung"], "min_sources": 1}
+{"id": "garden-pruning", "question": "Warum werden Gehoelze und Hecken fachgerecht geschnitten?", "expected_source_contains": "Gartenpflege", "expected_answer_contains_any": ["Vitalitaet", "Vitalität", "Austrieb"], "min_sources": 1}
+{"id": "rag-definition", "question": "Was kombiniert Retrieval-Augmented Generation?", "expected_source_contains": "sample_document", "expected_answer_contains_any": ["Sprachmodell", "Wissensdatenbank"], "min_sources": 1}
+{"id": "rag-ingestion", "question": "Welche Schritte fuehrt ingest.py aus?", "expected_source_contains": "sample_document", "expected_answer_contains_any": ["Laden", "Splitten", "Embedding", "Speichern"], "min_sources": 1}
 {"id": "unknown-answer", "question": "Welche Urlaubsregelung gilt fuer Mitarbeiter in diesem Unternehmen?", "should_refuse": true, "min_sources": 0}

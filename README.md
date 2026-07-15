@@ -38,7 +38,9 @@ flowchart LR
     Answer --> User
 
     Upload["PDF upload / reindex"] --> API
-    API --> Loader
+    API --> Jobs["Bounded index job queue"]
+    Jobs --> Worker["Background index worker"]
+    Worker --> Loader
 ```
 
 ## Screenshots
@@ -74,6 +76,8 @@ The sidebar supports document discovery, PDF upload, and manual reindexing:
 - The built-in rate limiter is process-local. For production with multiple app
   instances, use shared infrastructure such as Redis, API Management, or an
   ingress-level rate limiter.
+- Index jobs run in a bounded, process-local worker queue. This keeps local
+  requests responsive, but production deployments need a durable shared queue.
 
 ## Features
 
@@ -83,10 +87,11 @@ The sidebar supports document discovery, PDF upload, and manual reindexing:
 - Stores document chunks in a local ChromaDB vector database.
 - Rebuilds indexes through versioned collections so a failed build does not
   replace the active index.
+- Runs upload and reindex operations asynchronously with job-status polling.
 - Exposes a FastAPI `/ask` endpoint for RAG answers.
 - Returns source document names, page numbers, and excerpts with each answer.
 - Provides a Streamlit chat interface for interactive use.
-- Includes a lightweight RAG evaluation runner.
+- Includes deterministic retrieval smoke checks and live RAG evaluation cases.
 - Includes Docker packaging and a GitHub Actions CI workflow.
 - Supports optional bearer-token API protection with `RAG_API_TOKEN`.
 - Includes configurable in-memory rate limiting for expensive API routes.
@@ -109,20 +114,23 @@ Current hardening work includes:
 - Basic test coverage and CI validation.
 - Source-cited RAG responses.
 - PDF upload and reindex workflow.
-- Basic JSONL-driven RAG eval checks.
+- JSONL-driven deterministic retrieval and live RAG eval checks.
 - Optional API token protection.
 - Configurable in-memory rate limiting.
 - Structured observability logs for RAG and indexing paths.
 - Request IDs for correlating client errors, server logs, and API responses.
 - Transactional index activation and upload rollback on indexing failure.
 - Bounded, parser-validated PDF uploads and concurrent rebuild protection.
+- Bounded background indexing jobs with queued, running, completed, and failed
+  states.
 
 Planned improvements:
 
-- Add more RAG evaluation cases.
 - Complete Azure container deployment settings.
 - Replace in-memory rate limiting with shared infrastructure for multi-instance
   deployments.
+- Replace process-local index jobs with a durable shared queue for
+  multi-instance deployments.
 
 ## Local Setup
 
@@ -177,6 +185,8 @@ documents currently available to the backend.
 
 PDF uploads default to a 10 MiB file limit and a 200-page limit. Override them
 with `RAG_MAX_UPLOAD_BYTES` and `RAG_MAX_PDF_PAGES`.
+`RAG_MAX_INDEX_JOBS` controls the number of retained or active local jobs and
+defaults to 100.
 
 ## Demo Script
 
@@ -190,8 +200,10 @@ After starting the app, try this flow:
 5. Upload another PDF from the sidebar, click the German
    `Hochladen und indexieren` button, then ask a question about the new
    document.
-6. Run `python evals/run_eval.py` while the backend is running to see the basic
-   RAG quality checks.
+6. Run `python evals/run_retrieval_eval.py` for credential-free retrieval
+   checks.
+7. Run `python evals/run_eval.py` while the backend is running for live RAG
+   checks.
 
 ## Docker
 
@@ -231,15 +243,25 @@ streamlit run frontend.py
 
 ## Evaluation
 
-Run the app first, then execute the lightweight eval suite:
+Run the deterministic PDF extraction, chunking, source, and context checks:
+
+```bash
+python evals/run_retrieval_eval.py
+```
+
+This suite reads `evals/retrieval_cases.jsonl`, uses the production chunk sizes,
+and performs deterministic lexical ranking over the committed PDFs. It runs in
+CI without API credentials and acts as an ingestion/retrieval smoke test. It is
+not a replacement for vector or model-quality evaluation.
+
+For the live end-to-end suite, start the application and run:
 
 ```bash
 python evals/run_eval.py
 ```
 
-The eval runner reads `evals/questions.jsonl`, sends each question to `/ask`,
-and checks simple expectations such as source presence, expected source names,
-and refusal behavior.
+The live runner reads `evals/questions.jsonl`, sends each question to `/ask`,
+and checks answer terms, source names, source excerpts, and refusal behavior.
 
 ## API
 
@@ -290,7 +312,30 @@ Rebuild the index from all PDFs in `data/`:
 curl -X POST http://127.0.0.1:8000/reindex
 ```
 
-Example response shape:
+Uploads and reindex requests return HTTP `202 Accepted` with a job resource:
+
+```json
+{
+  "job_id": "8f84484f-19d6-4d9e-a662-dc952f16ee40",
+  "operation": "upload",
+  "status": "queued",
+  "request_id": "5a56c4c2-851f-46db-bd72-a6d5fb30e6fb",
+  "filename": "sample_document.pdf",
+  "result": null,
+  "error": null,
+  "created_at": "2026-07-15T12:00:00+00:00",
+  "updated_at": "2026-07-15T12:00:00+00:00"
+}
+```
+
+Poll the URL from the `Location` response header until the job is completed or
+failed:
+
+```bash
+curl http://127.0.0.1:8000/jobs/8f84484f-19d6-4d9e-a662-dc952f16ee40
+```
+
+Example `/ask` response shape:
 
 ```json
 {
@@ -311,7 +356,7 @@ Example response shape:
 - `.env` and `.env.*` are ignored by Git and Docker.
 - `example.env` contains placeholder values only.
 - Set `RAG_API_TOKEN` to require bearer-token access for `/ask`, `/documents`,
-  and `/reindex`.
+  `/reindex`, and `/jobs/{job_id}`.
 - `RAG_RATE_LIMIT_REQUESTS` and `RAG_RATE_LIMIT_WINDOW_SECONDS` limit repeated
   calls to `/ask`, `/documents`, and `/reindex`.
 - `RAG_MAX_UPLOAD_BYTES` and `RAG_MAX_PDF_PAGES` bound uploaded PDF processing.
@@ -335,6 +380,7 @@ The API logs structured events for the important paths:
   time, plus request ID when triggered through the API.
 - `rag_document_uploaded`: saved filename, upload size, page count, resulting
   PDF count, chunk count, total upload/index time, and request ID.
+- `rag_index_job_failed`: job ID, operation, safe error message, and request ID.
 - `rag_rate_limited`: client key, configured limit, window size, and retry delay
   when a request receives HTTP 429, plus request ID.
 - `http_request_completed`: method, path, status code, elapsed time, and request
@@ -344,8 +390,8 @@ Use `LOG_LEVEL=INFO` locally or in deployment to keep these metrics visible.
 
 ## CI
 
-GitHub Actions validates the project by installing dependencies, running tests,
-and building the Docker image.
+GitHub Actions validates the project by installing dependencies, running unit
+tests and deterministic retrieval checks, and building the Docker image.
 
 ## Dependency Management
 

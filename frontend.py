@@ -1,4 +1,5 @@
 import os
+import time
 
 import requests
 import streamlit as st
@@ -20,6 +21,7 @@ API_URL = os.environ.get("RAG_API_URL", "http://127.0.0.1:8000/ask")
 API_BASE_URL = API_URL.removesuffix("/ask")
 DOCUMENTS_URL = os.environ.get("RAG_DOCUMENTS_URL", f"{API_BASE_URL}/documents")
 REINDEX_URL = os.environ.get("RAG_REINDEX_URL", f"{API_BASE_URL}/reindex")
+JOBS_URL = os.environ.get("RAG_JOBS_URL", f"{API_BASE_URL}/jobs")
 RAG_API_TOKEN = os.environ.get("RAG_API_TOKEN")
 
 
@@ -50,6 +52,30 @@ def refresh_document_list():
         return []
 
 
+def wait_for_index_job(job, timeout=180):
+    job_id = job["job_id"]
+    deadline = time.monotonic() + timeout
+    current = job
+
+    while current.get("status") in {"queued", "running"}:
+        if time.monotonic() >= deadline:
+            raise RuntimeError("Zeitueberschreitung bei der Indexierung.")
+        time.sleep(1)
+        response = requests.get(
+            f"{JOBS_URL}/{job_id}",
+            headers=auth_headers(),
+            timeout=10,
+        )
+        response.raise_for_status()
+        current = response.json()
+
+    if current.get("status") == "failed":
+        raise RuntimeError(current.get("error") or "Indexierung fehlgeschlagen.")
+    if current.get("status") != "completed" or not current.get("result"):
+        raise RuntimeError("Ungueltiger Status der Indexierung.")
+    return current["result"]
+
+
 with st.sidebar:
     st.header("Dokumente")
 
@@ -75,16 +101,16 @@ with st.sidebar:
                     DOCUMENTS_URL,
                     files=files,
                     headers=auth_headers(),
-                    timeout=180,
+                    timeout=30,
                 )
                 response.raise_for_status()
-                payload = response.json()
+                payload = wait_for_index_job(response.json())
                 st.success(
                     "Index aktualisiert: "
                     f"{payload['pdf_count']} PDFs, {payload['chunks_created']} Chunks."
                 )
                 st.session_state.messages = []
-            except requests.exceptions.RequestException as e:
+            except (requests.exceptions.RequestException, RuntimeError) as e:
                 st.error(f"Upload fehlgeschlagen: {str(e)}")
 
     if st.button("Index neu erstellen"):
@@ -93,16 +119,16 @@ with st.sidebar:
                 response = requests.post(
                     REINDEX_URL,
                     headers=auth_headers(),
-                    timeout=180,
+                    timeout=30,
                 )
                 response.raise_for_status()
-                payload = response.json()
+                payload = wait_for_index_job(response.json())
                 st.success(
                     "Index aktualisiert: "
                     f"{payload['pdf_count']} PDFs, {payload['chunks_created']} Chunks."
                 )
                 st.session_state.messages = []
-            except requests.exceptions.RequestException as e:
+            except (requests.exceptions.RequestException, RuntimeError) as e:
                 st.error(f"Reindex fehlgeschlagen: {str(e)}")
 
 

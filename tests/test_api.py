@@ -1,8 +1,10 @@
-from io import BytesIO
 import os
+import time
+from io import BytesIO
 
 import pytest
 from fastapi.testclient import TestClient
+from index_jobs import IndexJobStore
 from langchain_core.documents import Document
 from pypdf import PdfWriter
 from rag_index import (
@@ -33,6 +35,17 @@ def make_pdf_bytes(page_count: int = 1) -> bytes:
 
 def setup_function():
     main.rate_limit_events.clear()
+    main.index_job_store.clear()
+
+
+def wait_for_terminal_job(job_id: str, timeout: float = 2.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        job = main.index_job_store.get(job_id)
+        if job and job["status"] in {"completed", "failed"}:
+            return job
+        time.sleep(0.01)
+    raise AssertionError(f"Job {job_id} did not finish in time")
 
 
 def test_health_is_available_without_api_key():
@@ -221,7 +234,7 @@ def test_upload_removes_saved_file_when_indexing_fails(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "GOOGLE_API_KEY", "configured-for-test")
     monkeypatch.setattr(main, "DATA_DIR", str(tmp_path))
 
-    def fail_rebuild(request):
+    def fail_rebuild(**kwargs):
         raise main.HTTPException(status_code=500, detail="index failed")
 
     monkeypatch.setattr(main, "_rebuild_vector_store", fail_rebuild)
@@ -231,7 +244,10 @@ def test_upload_removes_saved_file_when_indexing_fails(tmp_path, monkeypatch):
         files={"file": ("sample.pdf", make_pdf_bytes(), "application/pdf")},
     )
 
-    assert response.status_code == 500
+    assert response.status_code == 202
+    job = wait_for_terminal_job(response.json()["job_id"])
+    assert job["status"] == "failed"
+    assert job["error"] == "index failed"
     assert list(tmp_path.glob("*.pdf")) == []
 
 
@@ -239,11 +255,83 @@ def test_rebuild_rejects_concurrent_indexing(monkeypatch):
     monkeypatch.setattr(main, "GOOGLE_API_KEY", "configured-for-test")
     main.index_rebuild_lock.acquire()
     try:
-        response = client.post("/reindex")
+        with pytest.raises(main.HTTPException) as exc_info:
+            main._rebuild_vector_store()
     finally:
         main.index_rebuild_lock.release()
 
-    assert response.status_code == 409
+    assert exc_info.value.status_code == 409
+
+
+def test_reindex_returns_job_and_status_endpoint(monkeypatch):
+    monkeypatch.setattr(main, "GOOGLE_API_KEY", "configured-for-test")
+    monkeypatch.setattr(
+        main,
+        "_rebuild_vector_store",
+        lambda **kwargs: IndexStats(
+            pdf_count=2,
+            pages_loaded=3,
+            chunks_created=4,
+            data_dir="data",
+            vector_store="chroma",
+            collection_name="documents-test",
+        ),
+    )
+
+    response = client.post("/reindex", headers={"X-Request-ID": "job-request"})
+
+    assert response.status_code == 202
+    payload = response.json()
+    assert response.headers["Location"] == f"/jobs/{payload['job_id']}"
+    job = wait_for_terminal_job(payload["job_id"])
+    assert job["status"] == "completed"
+    assert job["request_id"] == "job-request"
+    assert job["result"]["chunks_created"] == 4
+
+    status_response = client.get(response.headers["Location"])
+    assert status_response.status_code == 200
+    assert status_response.json()["status"] == "completed"
+
+
+def test_unknown_job_returns_404():
+    response = client.get("/jobs/missing-job")
+
+    assert response.status_code == 404
+
+
+def test_job_status_requires_token_when_configured(monkeypatch):
+    job = main.index_job_store.create(
+        operation="reindex",
+        request_id="request-1",
+    )
+    monkeypatch.setattr(main, "RAG_API_TOKEN", "test-token")
+
+    unauthorized = client.get(f"/jobs/{job['job_id']}")
+    authorized = client.get(
+        f"/jobs/{job['job_id']}",
+        headers={"Authorization": "Bearer test-token"},
+    )
+
+    assert unauthorized.status_code == 401
+    assert authorized.status_code == 200
+
+
+def test_full_job_queue_rolls_back_pending_upload(tmp_path, monkeypatch):
+    store = IndexJobStore(max_jobs=1)
+    store.create(operation="reindex", request_id="existing-request")
+    monkeypatch.setattr(main, "index_job_store", store)
+    uploaded_path = tmp_path / "pending.pdf"
+    uploaded_path.write_bytes(make_pdf_bytes())
+
+    with pytest.raises(main.HTTPException) as exc_info:
+        main._submit_index_job(
+            operation="upload",
+            request_id="upload-request",
+            uploaded_path=uploaded_path,
+        )
+
+    assert exc_info.value.status_code == 503
+    assert uploaded_path.exists() is False
 
 
 def test_rebuild_restores_previous_collection_when_reload_fails(

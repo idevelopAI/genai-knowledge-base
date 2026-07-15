@@ -7,10 +7,20 @@ import threading
 import time
 import uuid
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Header,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+)
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
@@ -18,6 +28,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from pydantic import BaseModel, Field
 
+from index_jobs import IndexJobStore, JobCapacityError
 from rag_index import (
     IndexStats,
     build_vector_db,
@@ -75,6 +86,7 @@ RAG_MAX_UPLOAD_BYTES = _positive_int_from_env(
     10 * 1024 * 1024,
 )
 RAG_MAX_PDF_PAGES = _positive_int_from_env("RAG_MAX_PDF_PAGES", 200)
+RAG_MAX_INDEX_JOBS = _positive_int_from_env("RAG_MAX_INDEX_JOBS", 100)
 RAG_RATE_LIMIT_REQUESTS = _non_negative_int_from_env("RAG_RATE_LIMIT_REQUESTS", 60)
 RAG_RATE_LIMIT_WINDOW_SECONDS = _positive_int_from_env(
     "RAG_RATE_LIMIT_WINDOW_SECONDS", 60
@@ -89,6 +101,8 @@ REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 app = FastAPI(title="GenAI Knowledge Base API")
 rate_limit_events: defaultdict[str, deque[float]] = defaultdict(deque)
 index_rebuild_lock = threading.Lock()
+index_job_store = IndexJobStore(max_jobs=RAG_MAX_INDEX_JOBS)
+index_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rag-index")
 
 
 class QueryRequest(BaseModel):
@@ -119,8 +133,16 @@ class IndexResponse(BaseModel):
     vector_store: str
 
 
-class UploadResponse(IndexResponse):
-    filename: str
+class IndexJobResponse(BaseModel):
+    job_id: str
+    operation: str
+    status: str
+    request_id: str
+    created_at: str
+    updated_at: str
+    filename: str | None = None
+    result: IndexResponse | None = None
+    error: str | None = None
 
 
 def _elapsed_ms(start_time: float) -> int:
@@ -293,7 +315,11 @@ def _reload_rag_components() -> None:
     retriever, llm = _build_rag_components()
 
 
-def _rebuild_vector_store(request: Request | None = None) -> IndexStats:
+def _rebuild_vector_store(
+    request: Request | None = None,
+    *,
+    request_id: str | None = None,
+) -> IndexStats:
     google_api_key = _require_google_api_key()
     if not index_rebuild_lock.acquire(blocking=False):
         raise HTTPException(
@@ -302,7 +328,7 @@ def _rebuild_vector_store(request: Request | None = None) -> IndexStats:
         )
 
     start_time = time.perf_counter()
-    request_id = _request_id(request)
+    effective_request_id = request_id or _request_id(request)
 
     try:
         previous_collection_name = get_active_collection_name(
@@ -330,13 +356,13 @@ def _rebuild_vector_store(request: Request | None = None) -> IndexStats:
             except Exception:
                 logger.warning(
                     "rag_index_cleanup_failed request_id=%s collection=%s",
-                    request_id,
+                    effective_request_id,
                     previous_collection_name,
                 )
         logger.info(
             "rag_index_rebuilt status=success request_id=%s pdf_count=%s "
             "pages_loaded=%s chunks_created=%s elapsed_ms=%s",
-            request_id,
+            effective_request_id,
             stats.pdf_count,
             stats.pages_loaded,
             stats.chunks_created,
@@ -347,7 +373,7 @@ def _rebuild_vector_store(request: Request | None = None) -> IndexStats:
         logger.warning(
             "rag_index_rebuilt status=invalid_request request_id=%s elapsed_ms=%s "
             "error=%s",
-            request_id,
+            effective_request_id,
             _elapsed_ms(start_time),
             exc,
         )
@@ -355,7 +381,7 @@ def _rebuild_vector_store(request: Request | None = None) -> IndexStats:
     except Exception:
         logger.exception(
             "rag_index_rebuilt status=error request_id=%s elapsed_ms=%s",
-            request_id,
+            effective_request_id,
             _elapsed_ms(start_time),
         )
         raise HTTPException(
@@ -410,6 +436,115 @@ def build_sources(docs: list[Document]) -> list[SourceDocument]:
     return sources
 
 
+def _remove_uploaded_file(path: Path, request_id: str) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        logger.exception(
+            "rag_upload_rollback_failed request_id=%s filename=%s",
+            request_id,
+            path.name,
+        )
+
+
+def _run_index_job(
+    job_id: str,
+    *,
+    operation: str,
+    request_id: str,
+    uploaded_path: Path | None = None,
+    upload_bytes: int | None = None,
+    page_count: int | None = None,
+) -> None:
+    index_job_store.update(job_id, status="running")
+    started_at = time.perf_counter()
+
+    try:
+        stats = _rebuild_vector_store(request_id=request_id)
+        result_status = "uploaded_and_indexed" if uploaded_path else "reindexed"
+        result = _index_response(stats, status=result_status).model_dump()
+        index_job_store.update(job_id, status="completed", result=result)
+
+        if uploaded_path is not None:
+            logger.info(
+                "rag_document_uploaded request_id=%s job_id=%s filename=%s "
+                "bytes=%s pages=%s pdf_count=%s chunks_created=%s elapsed_ms=%s",
+                request_id,
+                job_id,
+                uploaded_path.name,
+                upload_bytes,
+                page_count,
+                stats.pdf_count,
+                stats.chunks_created,
+                _elapsed_ms(started_at),
+            )
+    except Exception as exc:
+        if uploaded_path is not None:
+            _remove_uploaded_file(uploaded_path, request_id)
+
+        if isinstance(exc, HTTPException) and isinstance(exc.detail, str):
+            error = exc.detail
+        else:
+            error = "Indexing failed unexpectedly."
+        index_job_store.update(job_id, status="failed", error=error)
+        logger.warning(
+            "rag_index_job_failed request_id=%s job_id=%s operation=%s error=%s",
+            request_id,
+            job_id,
+            operation,
+            error,
+        )
+
+
+def _submit_index_job(
+    *,
+    operation: str,
+    request_id: str,
+    uploaded_path: Path | None = None,
+    upload_bytes: int | None = None,
+    page_count: int | None = None,
+) -> dict[str, Any]:
+    try:
+        job = index_job_store.create(
+            operation=operation,
+            request_id=request_id,
+            filename=uploaded_path.name if uploaded_path else None,
+        )
+    except JobCapacityError as exc:
+        if uploaded_path is not None:
+            _remove_uploaded_file(uploaded_path, request_id)
+        raise HTTPException(
+            status_code=503,
+            detail="The index job queue is full. Try again later.",
+            headers={"Retry-After": "5"},
+        ) from exc
+
+    try:
+        index_executor.submit(
+            _run_index_job,
+            job["job_id"],
+            operation=operation,
+            request_id=request_id,
+            uploaded_path=uploaded_path,
+            upload_bytes=upload_bytes,
+            page_count=page_count,
+        )
+    except RuntimeError as exc:
+        if uploaded_path is not None:
+            _remove_uploaded_file(uploaded_path, request_id)
+        index_job_store.update(
+            job["job_id"],
+            status="failed",
+            error="The index worker is unavailable.",
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="The index worker is unavailable.",
+        ) from exc
+
+    return index_job_store.get(job["job_id"]) or job
+
+
 @app.get("/health")
 async def health() -> dict[str, bool | str | int]:
     return {
@@ -435,24 +570,46 @@ async def list_documents() -> DocumentListResponse:
 
 @app.post(
     "/reindex",
-    response_model=IndexResponse,
+    response_model=IndexJobResponse,
+    status_code=202,
     dependencies=[Depends(_require_api_token), Depends(_enforce_rate_limit)],
 )
-async def reindex_documents(request: Request) -> IndexResponse:
-    stats = _rebuild_vector_store(request)
-    return _index_response(stats, status="reindexed")
+async def reindex_documents(
+    request: Request,
+    response: Response,
+) -> IndexJobResponse:
+    _require_google_api_key()
+    job = _submit_index_job(
+        operation="reindex",
+        request_id=_request_id(request),
+    )
+    response.headers["Location"] = f"/jobs/{job['job_id']}"
+    return IndexJobResponse.model_validate(job)
+
+
+@app.get(
+    "/jobs/{job_id}",
+    response_model=IndexJobResponse,
+    dependencies=[Depends(_require_api_token)],
+)
+async def get_index_job(job_id: str) -> IndexJobResponse:
+    job = index_job_store.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Index job not found.")
+    return IndexJobResponse.model_validate(job)
 
 
 @app.post(
     "/documents",
-    response_model=UploadResponse,
+    response_model=IndexJobResponse,
+    status_code=202,
     dependencies=[Depends(_require_api_token), Depends(_enforce_rate_limit)],
 )
 async def upload_document(
     request: Request,
+    response: Response,
     file: UploadFile = File(...),
-) -> UploadResponse:
-    start_time = time.perf_counter()
+) -> IndexJobResponse:
     filename = file.filename or ""
     if not filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF uploads are supported.")
@@ -474,38 +631,15 @@ async def upload_document(
     _require_google_api_key()
 
     saved_path = save_pdf_bytes(contents, filename, DATA_DIR)
-    try:
-        stats = _rebuild_vector_store(request)
-    except Exception:
-        try:
-            saved_path.unlink(missing_ok=True)
-        except OSError:
-            logger.exception(
-                "rag_upload_rollback_failed request_id=%s filename=%s",
-                _request_id(request),
-                saved_path.name,
-            )
-        raise
-    logger.info(
-        "rag_document_uploaded request_id=%s filename=%s bytes=%s pages=%s "
-        "pdf_count=%s chunks_created=%s elapsed_ms=%s",
-        _request_id(request),
-        saved_path.name,
-        len(contents),
-        page_count,
-        stats.pdf_count,
-        stats.chunks_created,
-        _elapsed_ms(start_time),
+    job = _submit_index_job(
+        operation="upload",
+        request_id=_request_id(request),
+        uploaded_path=saved_path,
+        upload_bytes=len(contents),
+        page_count=page_count,
     )
-    return UploadResponse(
-        filename=saved_path.name,
-        status="uploaded_and_indexed",
-        pdf_count=stats.pdf_count,
-        pages_loaded=stats.pages_loaded,
-        chunks_created=stats.chunks_created,
-        data_dir=stats.data_dir,
-        vector_store=stats.vector_store,
-    )
+    response.headers["Location"] = f"/jobs/{job['job_id']}"
+    return IndexJobResponse.model_validate(job)
 
 
 @app.post(

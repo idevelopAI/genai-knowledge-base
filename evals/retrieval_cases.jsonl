@@ -1,0 +1,5 @@
+{"id": "aeration-aftercare", "question": "Was soll nach dem Aerifizieren auf dem Rasen verteilt werden?", "expected_source": "Gartenpflege_Leitfaden.pdf", "expected_context_terms": ["Quarzsand", "Kanaele"]}
+{"id": "irrigation-efficiency", "question": "Wie reduzieren moderne Bewaesserungssysteme den Wasserverbrauch?", "expected_source": "Gartenpflege_Leitfaden.pdf", "expected_context_terms": ["Versenkregnern", "Tropfrohren", "Verdunstung"]}
+{"id": "pruning-purpose", "question": "Warum werden Gehoelze und Hecken fachgerecht geschnitten?", "expected_source": "Gartenpflege_Leitfaden.pdf", "expected_context_terms": ["Vitalitaet", "Austrieb"]}
+{"id": "rag-definition", "question": "Welche zwei Komponenten kombiniert Retrieval-Augmented Generation?", "expected_source": "sample_document.pdf", "expected_context_terms": ["Sprachmodellen", "Wissensdatenbank"]}
+{"id": "ingestion-steps", "question": "Welche Schritte fuehrt ingest.py bei der Dokumentverarbeitung aus?", "expected_source": "sample_document.pdf", "expected_context_terms": ["Laden", "Splitten", "Embedding", "Speichern"]}

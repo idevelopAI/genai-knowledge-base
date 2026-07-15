@@ -55,8 +55,27 @@ def score_case(case: dict[str, Any], payload: dict[str, Any]) -> tuple[bool, lis
         if expected_source.lower() not in source_names.lower():
             failures.append(f"missing expected source containing {expected_source!r}")
 
+    normalized_answer = answer.lower()
+    expected_answer_terms = case.get("expected_answer_contains_any", [])
+    if expected_answer_terms and not any(
+        term.lower() in normalized_answer for term in expected_answer_terms
+    ):
+        failures.append(
+            f"answer missing all expected terms {expected_answer_terms!r}"
+        )
+
+    expected_excerpt_terms = case.get("expected_excerpt_contains_any", [])
+    source_excerpts = " ".join(
+        source.get("excerpt", "") for source in sources
+    ).lower()
+    if expected_excerpt_terms and not any(
+        term.lower() in source_excerpts for term in expected_excerpt_terms
+    ):
+        failures.append(
+            f"source excerpts missing all expected terms {expected_excerpt_terms!r}"
+        )
+
     if case.get("should_refuse"):
-        normalized_answer = answer.lower()
         if not any(marker in normalized_answer for marker in UNKNOWN_MARKERS):
             failures.append("expected refusal/unknown answer")
 

@@ -25,5 +25,8 @@ jobs:
       - name: Run tests
         run: python -m pytest
 
+      - name: Run deterministic retrieval evaluation
+        run: python evals/run_retrieval_eval.py
+
       - name: Build Docker image
         run: docker build -t rag-backend:test .
