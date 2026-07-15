@@ -96,7 +96,7 @@ The sidebar supports document discovery, PDF upload, and manual reindexing:
 - Exposes a FastAPI `/ask` endpoint for RAG answers.
 - Returns source document names, page numbers, and excerpts with each answer.
 - Prompts grounded answers to include inline `[Source N]` evidence markers and
-  checks them in the live evaluation suite.
+  normalizes missing or invalid markers against the retrieved source list.
 - Refuses without calling the LLM when retrieval returns no usable context.
 - Filters retrieved chunks by a configurable minimum relevance score and
   refuses when none pass.
@@ -109,6 +109,8 @@ The sidebar supports document discovery, PDF upload, and manual reindexing:
 - Adds `X-Request-ID` headers for request tracing across API responses and
   logs.
 - Logs request timing, retrieval timing, LLM timing, and indexing metrics.
+- Runs blocking embedding and chat calls in FastAPI's worker threadpool and
+  bounds Gemini request duration and retries.
 - Keeps secrets out of tracked code and Docker build context.
 
 ## Current Scope
@@ -199,8 +201,10 @@ with `RAG_MAX_UPLOAD_BYTES` and `RAG_MAX_PDF_PAGES`.
 `RAG_MAX_INDEX_JOBS` controls the number of retained or active local jobs and
 defaults to 100.
 `RAG_MIN_RELEVANCE_SCORE` controls the `0..1` scored-retrieval cutoff and
-defaults to `0.45`. Reindex once after upgrading so the active collection uses
+defaults to `0.65`. Reindex once after upgrading so the active collection uses
 cosine distance consistently.
+`GEMINI_REQUEST_TIMEOUT_SECONDS` defaults to `45`, and `GEMINI_MAX_RETRIES`
+defaults to `1`, keeping upstream failures within the frontend request window.
 
 ## Demo Script
 
@@ -276,7 +280,21 @@ python evals/run_eval.py
 
 The live runner reads `evals/questions.jsonl`, sends each question to `/ask`,
 and checks answer terms, source names, source excerpts, refusal behavior, and
-inline `[Source N]` citations for grounded-answer cases.
+inline `[Source N]` citations for grounded-answer cases. It uses
+`RAG_API_TOKEN` from the process environment when API authentication is enabled.
+
+Calibrate the scored-retrieval cutoff against the same labeled cases:
+
+```bash
+python evals/calibrate_relevance.py
+```
+
+The calibration runner embeds each evaluation question, compares candidate
+thresholds, and reports false accepts, false refusals, and a recommended
+cutoff. It does not call the chat model. Treat the result as a dataset-specific
+baseline and rerun it after changing documents, chunking, or embedding models.
+For the committed two-document corpus and balanced ten-case dataset, the latest
+calibration selected `0.65` with no false accepts or false refusals.
 
 ## API
 
@@ -383,6 +401,8 @@ Example `/ask` response shape:
 - Index rebuilds activate a new version only after embedding succeeds; the
   previous collection remains active on failure.
 - API errors avoid returning raw internal exception text to users.
+- Transient model-provider failures return HTTP `503` with `Retry-After`
+  instead of being reported as internal application failures.
 - Questions are trimmed, reject blank input, and are limited to 2,000
   characters.
 - Retrieved document instructions are explicitly treated as untrusted data;

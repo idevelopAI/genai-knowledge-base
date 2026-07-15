@@ -4,3 +4,7 @@
 {"id": "rag-definition", "question": "Was kombiniert Retrieval-Augmented Generation?", "expected_source_contains": "sample_document", "expected_answer_contains_any": ["Sprachmodell", "Wissensdatenbank"], "min_sources": 1, "require_citations": true}
 {"id": "rag-ingestion", "question": "Welche Schritte fuehrt ingest.py aus?", "expected_source_contains": "sample_document", "expected_answer_contains_any": ["Laden", "Splitten", "Embedding", "Speichern"], "min_sources": 1, "require_citations": true}
 {"id": "unknown-answer", "question": "Welche Urlaubsregelung gilt fuer Mitarbeiter in diesem Unternehmen?", "should_refuse": true, "min_sources": 0}
+{"id": "unknown-budget", "question": "Wie hoch ist das Jahresbudget des Unternehmens?", "should_refuse": true, "min_sources": 0}
+{"id": "unknown-vpn", "question": "Wie wird der Firmenzugang zum VPN eingerichtet?", "should_refuse": true, "min_sources": 0}
+{"id": "unknown-founding", "question": "Wann wurde das Unternehmen gegruendet?", "should_refuse": true, "min_sources": 0}
+{"id": "unknown-expenses", "question": "Welche Reisekosten werden den Mitarbeitern erstattet?", "should_refuse": true, "min_sources": 0}

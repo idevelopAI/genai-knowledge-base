@@ -1,6 +1,12 @@
 from pathlib import Path
 
-from evals.run_eval import score_case as score_live_case
+from evals.calibrate_relevance import (
+    ScoredCase,
+    evaluate_thresholds,
+    parse_thresholds,
+    recommend_threshold,
+)
+from evals.run_eval import ask_question, score_case as score_live_case
 from evals.run_retrieval_eval import (
     load_cases,
     load_chunks,
@@ -73,6 +79,53 @@ def test_live_eval_rejects_citation_to_unavailable_source():
 
     assert passed is False
     assert failures == ["inline citation references an unavailable source"]
+
+
+def test_live_eval_sends_optional_bearer_token(monkeypatch):
+    captured = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"answer": "ok", "sources": []}
+
+    def fake_post(url, json, headers, timeout):
+        captured.update(
+            url=url,
+            json=json,
+            headers=headers,
+            timeout=timeout,
+        )
+        return Response()
+
+    monkeypatch.setattr("evals.run_eval.requests.post", fake_post)
+
+    payload = ask_question("http://api/ask", "Question", 10, "test-token")
+
+    assert payload == {"answer": "ok", "sources": []}
+    assert captured["headers"] == {"Authorization": "Bearer test-token"}
+
+
+def test_relevance_calibration_recommends_best_balanced_threshold():
+    cases = [
+        ScoredCase("answer-1", should_refuse=False, best_score=0.8),
+        ScoredCase("answer-2", should_refuse=False, best_score=0.6),
+        ScoredCase("unknown", should_refuse=True, best_score=0.4),
+    ]
+
+    results = evaluate_thresholds(cases, [0.35, 0.45, 0.65])
+    recommendation = recommend_threshold(results)
+
+    assert recommendation.threshold == 0.45
+    assert recommendation.correct == 3
+    assert recommendation.false_accepts == 0
+    assert recommendation.false_refusals == 0
+
+
+def test_relevance_calibration_parses_sorted_unique_thresholds():
+    assert parse_thresholds("0.6, 0.4, 0.6") == [0.4, 0.6]
 
 
 def test_committed_retrieval_cases_pass_without_external_services():

@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -33,8 +34,19 @@ def load_cases(path: Path) -> list[dict[str, Any]]:
     return cases
 
 
-def ask_question(api_url: str, question: str, timeout: int) -> dict[str, Any]:
-    response = requests.post(api_url, json={"question": question}, timeout=timeout)
+def ask_question(
+    api_url: str,
+    question: str,
+    timeout: int,
+    api_token: str | None = None,
+) -> dict[str, Any]:
+    headers = {"Authorization": f"Bearer {api_token}"} if api_token else None
+    response = requests.post(
+        api_url,
+        json={"question": question},
+        headers=headers,
+        timeout=timeout,
+    )
     response.raise_for_status()
     return response.json()
 
@@ -96,6 +108,7 @@ def main() -> int:
     parser.add_argument("--api-url", default="http://127.0.0.1:8000/ask")
     parser.add_argument("--cases", default="evals/questions.jsonl")
     parser.add_argument("--timeout", type=int, default=60)
+    parser.add_argument("--api-token", default=os.environ.get("RAG_API_TOKEN"))
     args = parser.parse_args()
 
     cases_path = Path(args.cases)
@@ -105,7 +118,12 @@ def main() -> int:
     for case in cases:
         case_id = case.get("id", case["question"])
         try:
-            payload = ask_question(args.api_url, case["question"], args.timeout)
+            payload = ask_question(
+                args.api_url,
+                case["question"],
+                args.timeout,
+                args.api_token,
+            )
             ok, failures = score_case(case, payload)
         except requests.exceptions.RequestException as exc:
             ok = False

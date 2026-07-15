@@ -98,7 +98,7 @@ DATA_DIR = os.environ.get("DATA_DIR", "./data")
 CHROMA_DB_DIR = os.environ.get("CHROMA_DB_DIR", "./chroma_db")
 CHROMA_COLLECTION_NAME = os.environ.get("CHROMA_COLLECTION_NAME", "langchain")
 RAG_TOP_K = _positive_int_from_env("RAG_TOP_K", 3)
-RAG_MIN_RELEVANCE_SCORE = _unit_float_from_env("RAG_MIN_RELEVANCE_SCORE", 0.45)
+RAG_MIN_RELEVANCE_SCORE = _unit_float_from_env("RAG_MIN_RELEVANCE_SCORE", 0.65)
 RAG_CHUNK_SIZE = _positive_int_from_env("RAG_CHUNK_SIZE", 1000)
 RAG_CHUNK_OVERLAP = _positive_int_from_env("RAG_CHUNK_OVERLAP", 200)
 RAG_MAX_UPLOAD_BYTES = _positive_int_from_env(
@@ -115,8 +115,14 @@ GEMINI_EMBEDDING_MODEL = os.environ.get(
     "GEMINI_EMBEDDING_MODEL", "models/gemini-embedding-001"
 )
 GEMINI_CHAT_MODEL = os.environ.get("GEMINI_CHAT_MODEL", "gemini-3.5-flash")
+GEMINI_REQUEST_TIMEOUT_SECONDS = _positive_int_from_env(
+    "GEMINI_REQUEST_TIMEOUT_SECONDS",
+    45,
+)
+GEMINI_MAX_RETRIES = _non_negative_int_from_env("GEMINI_MAX_RETRIES", 1)
 REQUEST_ID_HEADER = "X-Request-ID"
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+SOURCE_MARKER_PATTERN = re.compile(r"\[Source (\d+)\]", re.IGNORECASE)
 MAX_QUESTION_LENGTH = 2000
 NO_CONTEXT_ANSWER = (
     "Ich weiss es nicht, da in den bereitgestellten Dokumenten keine "
@@ -216,6 +222,14 @@ class RelevanceFilteringRetriever:
 
 def _elapsed_ms(start_time: float) -> int:
     return round((time.perf_counter() - start_time) * 1000)
+
+
+def _provider_status_code(exc: Exception) -> int | None:
+    for attribute in ("status_code", "code"):
+        value = getattr(exc, attribute, None)
+        if isinstance(value, int):
+            return value
+    return None
 
 
 def _request_id(request: Request | None) -> str:
@@ -360,6 +374,8 @@ def _build_rag_components() -> tuple[Any | None, Any | None]:
         model=GEMINI_CHAT_MODEL,
         temperature=0,
         google_api_key=GOOGLE_API_KEY,
+        timeout=GEMINI_REQUEST_TIMEOUT_SECONDS,
+        max_retries=GEMINI_MAX_RETRIES,
     )
     return retriever, llm
 
@@ -531,6 +547,27 @@ def build_sources(docs: list[Document]) -> list[SourceDocument]:
             )
         )
     return sources
+
+
+def ensure_source_markers(answer: str, source_count: int) -> str:
+    if source_count <= 0:
+        return answer
+
+    valid_markers = []
+
+    def remove_invalid_marker(match: re.Match[str]) -> str:
+        source_number = int(match.group(1))
+        if 1 <= source_number <= source_count:
+            valid_markers.append(source_number)
+            return match.group(0)
+        return ""
+
+    normalized = SOURCE_MARKER_PATTERN.sub(remove_invalid_marker, answer).strip()
+    if valid_markers:
+        return normalized
+
+    markers = " ".join(f"[Source {index}]" for index in range(1, source_count + 1))
+    return f"{normalized}\n\nQuellen: {markers}"
 
 
 def _remove_uploaded_file(path: Path, request_id: str) -> None:
@@ -745,7 +782,7 @@ async def upload_document(
     response_model=QueryResponse,
     dependencies=[Depends(_require_api_token), Depends(_enforce_rate_limit)],
 )
-async def ask_question(query: QueryRequest, request: Request) -> QueryResponse:
+def ask_question(query: QueryRequest, request: Request) -> QueryResponse:
     request_start = time.perf_counter()
     if retriever is None or llm is None:
         raise HTTPException(
@@ -777,11 +814,14 @@ async def ask_question(query: QueryRequest, request: Request) -> QueryResponse:
 
         llm_start = time.perf_counter()
         chain = prompt | llm | StrOutputParser()
-        answer = chain.invoke(
-            {
-                "context": format_docs(docs),
-                "question": query.question,
-            }
+        answer = ensure_source_markers(
+            chain.invoke(
+                {
+                    "context": format_docs(docs),
+                    "question": query.question,
+                }
+            ),
+            len(docs),
         )
         llm_ms = _elapsed_ms(llm_start)
         total_ms = _elapsed_ms(request_start)
@@ -800,7 +840,23 @@ async def ask_question(query: QueryRequest, request: Request) -> QueryResponse:
             total_ms,
         )
         return QueryResponse(answer=answer, sources=build_sources(docs))
-    except Exception:
+    except Exception as exc:
+        provider_status = _provider_status_code(exc)
+        if provider_status in {429, 500, 502, 503, 504}:
+            logger.warning(
+                "rag_question_answered status=provider_unavailable request_id=%s "
+                "provider_status=%s question_chars=%s total_ms=%s",
+                _request_id(request),
+                provider_status,
+                len(query.question),
+                _elapsed_ms(request_start),
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="The model provider is temporarily unavailable.",
+                headers={"Retry-After": "5"},
+            ) from exc
+
         logger.exception(
             "rag_question_answered status=error request_id=%s question_chars=%s "
             "total_ms=%s",
@@ -811,4 +867,4 @@ async def ask_question(query: QueryRequest, request: Request) -> QueryResponse:
         raise HTTPException(
             status_code=500,
             detail="Unable to generate an answer right now.",
-        )
+        ) from exc

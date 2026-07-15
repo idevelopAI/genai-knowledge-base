@@ -150,6 +150,26 @@ def test_ask_returns_without_llm_call_when_retrieval_has_no_context(monkeypatch)
     }
 
 
+def test_ask_maps_transient_provider_failure_to_503(monkeypatch):
+    class ProviderUnavailable(Exception):
+        status_code = 503
+
+    class FailingRetriever:
+        def retrieve(self, question):
+            raise ProviderUnavailable("temporary upstream failure")
+
+    monkeypatch.setattr(main, "retriever", FailingRetriever())
+    monkeypatch.setattr(main, "llm", object())
+
+    response = client.post("/ask", json={"question": "Known topic"})
+
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "5"
+    assert response.json()["detail"] == (
+        "The model provider is temporarily unavailable."
+    )
+
+
 def test_relevance_filter_keeps_only_scored_usable_documents():
     relevant = Document(
         page_content="Relevant context",
@@ -511,6 +531,22 @@ def test_prepare_retrieved_documents_removes_empty_and_exact_duplicates():
 def test_system_prompt_treats_document_context_as_untrusted_and_requires_sources():
     assert "nicht vertrauenswuerdigen Dokumentdaten" in main.system_prompt
     assert "[Source N]" in main.system_prompt
+
+
+def test_ensure_source_markers_appends_available_sources_when_missing():
+    answer = main.ensure_source_markers("Grounded answer.", source_count=2)
+
+    assert answer == "Grounded answer.\n\nQuellen: [Source 1] [Source 2]"
+
+
+def test_ensure_source_markers_removes_unavailable_source_numbers():
+    answer = main.ensure_source_markers(
+        "First claim [Source 1]. Invalid [Source 9].",
+        source_count=2,
+    )
+
+    assert "[Source 1]" in answer
+    assert "[Source 9]" not in answer
 
 
 def test_sanitize_filename_removes_path_and_unsafe_characters():
