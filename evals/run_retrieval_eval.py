@@ -10,7 +10,13 @@ from typing import Any
 
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from pypdf import PdfReader
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from rag_index import load_pdf_documents
 
 
 TOKEN_PATTERN = re.compile(r"[a-z0-9]{3,}")
@@ -69,24 +75,16 @@ def load_cases(path: Path) -> list[dict[str, Any]]:
 
 
 def load_chunks(data_dir: Path, chunk_size: int, chunk_overlap: int) -> list[Document]:
-    pages = []
-    for pdf_path in sorted(data_dir.glob("*.pdf")):
-        reader = PdfReader(pdf_path)
-        for page_number, page in enumerate(reader.pages, start=1):
-            text = page.extract_text() or ""
-            if text.strip():
-                pages.append(
-                    Document(
-                        page_content=text,
-                        metadata={"source": pdf_path.name, "page": page_number},
-                    )
-                )
+    pages = load_pdf_documents(sorted(data_dir.glob("*.pdf")))
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
     )
-    return splitter.split_documents(pages)
+    chunks = splitter.split_documents(pages)
+    for chunk in chunks:
+        chunk.metadata["source"] = Path(str(chunk.metadata["source"])).name
+    return chunks
 
 
 def rank_chunks(question: str, chunks: list[Document]) -> list[Document]:

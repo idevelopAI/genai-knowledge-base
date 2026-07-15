@@ -7,7 +7,7 @@ from pathlib import Path
 import chromadb
 from chromadb.errors import NotFoundError
 from langchain_chroma import Chroma
-from langchain_community.document_loaders import PyPDFDirectoryLoader
+from langchain_core.documents import Document
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
@@ -88,6 +88,35 @@ def validate_pdf_bytes(data: bytes, max_pages: int) -> int:
     return page_count
 
 
+def load_pdf_documents(pdf_files: list[Path]) -> list[Document]:
+    documents = []
+    for pdf_path in pdf_files:
+        try:
+            reader = PdfReader(pdf_path)
+        except (PdfReadError, OSError, ValueError, EOFError) as exc:
+            raise ValueError(f"Unable to read PDF {pdf_path.name!r}.") from exc
+
+        if reader.is_encrypted:
+            raise ValueError(f"Encrypted PDF {pdf_path.name!r} is not supported.")
+
+        try:
+            for page_number, page in enumerate(reader.pages):
+                documents.append(
+                    Document(
+                        page_content=page.extract_text() or "",
+                        metadata={
+                            "source": str(pdf_path),
+                            "page": page_number,
+                        },
+                    )
+                )
+        except (PdfReadError, OSError, ValueError, EOFError) as exc:
+            raise ValueError(
+                f"Unable to extract text from PDF {pdf_path.name!r}."
+            ) from exc
+    return documents
+
+
 def get_active_collection_name(
     persist_directory: str,
     default_collection_name: str,
@@ -133,8 +162,7 @@ def build_vector_db(
     if not pdf_files:
         raise ValueError(f"No PDF files found in {data_dir}")
 
-    loader = PyPDFDirectoryLoader(data_dir)
-    docs = loader.load()
+    docs = load_pdf_documents(pdf_files)
     if not docs:
         raise ValueError(f"No document pages could be loaded from {data_dir}")
 
@@ -143,6 +171,8 @@ def build_vector_db(
         chunk_overlap=chunk_overlap,
     )
     splits = text_splitter.split_documents(docs)
+    if not splits:
+        raise ValueError(f"No extractable text found in PDFs from {data_dir}")
 
     embeddings = GoogleGenerativeAIEmbeddings(
         model=embedding_model,

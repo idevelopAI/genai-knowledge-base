@@ -3,8 +3,9 @@
 [![CI](https://github.com/idevelopAI/genai-knowledge-base/actions/workflows/ci.yml/badge.svg)](https://github.com/idevelopAI/genai-knowledge-base/actions/workflows/ci.yml)
 
 A containerized Retrieval-Augmented Generation system for asking questions over
-internal PDF documents. The project combines a FastAPI backend, LangChain,
-ChromaDB, Google Gemini models, and a Streamlit chat UI.
+internal PDF documents. The project combines a FastAPI backend, direct `pypdf`
+document loading, LangChain integrations, ChromaDB, Google Gemini models, and a
+Streamlit chat UI.
 
 The system covers document ingestion, vector search, grounded answer
 generation, API access, Docker-based packaging, CI checks, and an Azure
@@ -24,7 +25,7 @@ context-grounded answers with source references.
 
 ```mermaid
 flowchart LR
-    PDFs["PDF documents"] --> Loader["LangChain PDF loader"]
+    PDFs["PDF documents"] --> Loader["pypdf page loader"]
     Loader --> Splitter["Recursive text splitter"]
     Splitter --> Embeddings["Gemini embeddings"]
     Embeddings --> Chroma["ChromaDB vector store"]
@@ -56,7 +57,7 @@ The sidebar supports document discovery, PDF upload, and manual reindexing:
 ## Tech Stack
 
 - Backend: Python, FastAPI, Pydantic
-- RAG: LangChain, ChromaDB, Google Gemini
+- RAG: pypdf, LangChain integrations, ChromaDB, Google Gemini
 - Frontend: Streamlit
 - DevOps: Docker, GitHub Actions
 - Infrastructure: Terraform for an Azure deployment draft
@@ -399,6 +400,9 @@ tests and deterministic retrieval checks, and building the Docker image.
   intentionally uses.
 - `requirements.lock.txt` pins the full resolved environment used by CI and
   Docker.
+- Direct PDF extraction uses `pypdf`; the project depends only on the LangChain
+  integration packages it imports instead of the umbrella and community
+  packages.
 - After changing direct dependencies, regenerate the lock file with
   `pip freeze > requirements.lock.txt` from a freshly installed environment.
 

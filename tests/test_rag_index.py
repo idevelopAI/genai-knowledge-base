@@ -1,24 +1,22 @@
+from pathlib import Path
+
 import pytest
 from langchain_core.documents import Document
 
 import rag_index
 
 
-class StubPdfLoader:
-    def __init__(self, data_dir):
-        self.data_dir = data_dir
-
-    def load(self):
-        return [
+def configure_index_stubs(monkeypatch, from_documents):
+    monkeypatch.setattr(
+        rag_index,
+        "load_pdf_documents",
+        lambda pdf_files: [
             Document(
                 page_content="Test content",
-                metadata={"source": f"{self.data_dir}/sample.pdf", "page": 0},
+                metadata={"source": str(pdf_files[0]), "page": 0},
             )
-        ]
-
-
-def configure_index_stubs(monkeypatch, from_documents):
-    monkeypatch.setattr(rag_index, "PyPDFDirectoryLoader", StubPdfLoader)
+        ],
+    )
     monkeypatch.setattr(
         rag_index,
         "GoogleGenerativeAIEmbeddings",
@@ -86,3 +84,14 @@ def test_successful_index_build_activates_versioned_collection(tmp_path, monkeyp
         == stats.collection_name
     )
     assert list(vector_dir.glob(".active_collection.*.tmp")) == []
+
+
+def test_direct_pdf_loader_preserves_source_and_page_metadata():
+    project_root = Path(__file__).resolve().parents[1]
+    pdf_path = project_root / "data" / "sample_document.pdf"
+
+    documents = rag_index.load_pdf_documents([pdf_path])
+
+    assert documents
+    assert documents[0].metadata == {"source": str(pdf_path), "page": 0}
+    assert "Retrieval-Augmented Generation" in documents[0].page_content
