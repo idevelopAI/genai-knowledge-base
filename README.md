@@ -401,6 +401,10 @@ Example `/ask` response shape:
 
 ## Security
 
+Report suspected vulnerabilities privately as described in
+[`SECURITY.md`](SECURITY.md). Do not include credentials or internal documents
+in public issues.
+
 - Real secrets must stay in local environment variables or `.env`.
 - `.env` and `.env.*` are ignored by Git and Docker.
 - `example.env` contains placeholder values only.
@@ -471,12 +475,6 @@ tests and deterministic retrieval checks, and building the Docker image.
 The `terraform/` folder contains an Azure infrastructure draft for the future
 deployment path. Before production use, it should be extended with container
 image settings, secret management, managed identity, and deployment outputs.
-
-## Security
-
-Report suspected vulnerabilities privately as described in
-[`SECURITY.md`](SECURITY.md). Do not include credentials or internal documents
-in public issues.
 
 ## License
 
