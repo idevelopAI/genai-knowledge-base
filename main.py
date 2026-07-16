@@ -31,6 +31,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmb
 from pydantic import BaseModel, Field, field_validator
 
 from index_jobs import IndexJobStore, JobCapacityError
+from reliability import CircuitBreaker, CircuitOpenError, TTLCache
 from rag_index import (
     IndexStats,
     build_vector_db,
@@ -110,6 +111,16 @@ RAG_MAX_INDEX_JOBS = _positive_int_from_env("RAG_MAX_INDEX_JOBS", 100)
 RAG_RATE_LIMIT_REQUESTS = _non_negative_int_from_env("RAG_RATE_LIMIT_REQUESTS", 60)
 RAG_RATE_LIMIT_WINDOW_SECONDS = _positive_int_from_env(
     "RAG_RATE_LIMIT_WINDOW_SECONDS", 60
+)
+RAG_CACHE_TTL_SECONDS = _non_negative_int_from_env("RAG_CACHE_TTL_SECONDS", 300)
+RAG_CACHE_MAX_ENTRIES = _non_negative_int_from_env("RAG_CACHE_MAX_ENTRIES", 256)
+RAG_CIRCUIT_FAILURE_THRESHOLD = _positive_int_from_env(
+    "RAG_CIRCUIT_FAILURE_THRESHOLD",
+    3,
+)
+RAG_CIRCUIT_RECOVERY_SECONDS = _positive_int_from_env(
+    "RAG_CIRCUIT_RECOVERY_SECONDS",
+    60,
 )
 GEMINI_EMBEDDING_MODEL = os.environ.get(
     "GEMINI_EMBEDDING_MODEL", "models/gemini-embedding-001"
@@ -192,10 +203,17 @@ class RetrievalResult:
 
 
 class RelevanceFilteringRetriever:
-    def __init__(self, vectorstore: Chroma, top_k: int, min_score: float) -> None:
+    def __init__(
+        self,
+        vectorstore: Chroma,
+        top_k: int,
+        min_score: float,
+        index_revision: str = "unknown",
+    ) -> None:
         self.vectorstore = vectorstore
         self.top_k = top_k
         self.min_score = min_score
+        self.index_revision = index_revision
 
     def retrieve(self, question: str) -> RetrievalResult:
         candidates = self.vectorstore.similarity_search_with_relevance_scores(
@@ -218,6 +236,16 @@ class RelevanceFilteringRetriever:
             candidate_count=len(candidates),
             best_candidate_score=max(valid_scores, default=None),
         )
+
+
+answer_cache = TTLCache[QueryResponse](
+    max_entries=RAG_CACHE_MAX_ENTRIES,
+    ttl_seconds=RAG_CACHE_TTL_SECONDS,
+)
+provider_circuit = CircuitBreaker(
+    failure_threshold=RAG_CIRCUIT_FAILURE_THRESHOLD,
+    recovery_seconds=RAG_CIRCUIT_RECOVERY_SECONDS,
+)
 
 
 def _elapsed_ms(start_time: float) -> int:
@@ -369,6 +397,7 @@ def _build_rag_components() -> tuple[Any | None, Any | None]:
         vectorstore,
         top_k=RAG_TOP_K,
         min_score=RAG_MIN_RELEVANCE_SCORE,
+        index_revision=active_collection_name,
     )
     llm = ChatGoogleGenerativeAI(
         model=GEMINI_CHAT_MODEL,
@@ -406,6 +435,7 @@ def _index_response(stats: IndexStats, status: str = "indexed") -> IndexResponse
 def _reload_rag_components() -> None:
     global retriever, llm
     retriever, llm = _build_rag_components()
+    answer_cache.clear()
 
 
 def _rebuild_vector_store(
@@ -570,6 +600,23 @@ def ensure_source_markers(answer: str, source_count: int) -> str:
     return f"{normalized}\n\nQuellen: {markers}"
 
 
+def _answer_cache_key(question: str) -> str:
+    index_revision = getattr(retriever, "index_revision", "unknown")
+    components = (
+        question,
+        index_revision,
+        GEMINI_CHAT_MODEL,
+        GEMINI_EMBEDDING_MODEL,
+        str(RAG_TOP_K),
+        str(RAG_MIN_RELEVANCE_SCORE),
+    )
+    return hashlib.sha256("\0".join(components).encode("utf-8")).hexdigest()
+
+
+def _cache_response(cache_key: str, response: QueryResponse) -> None:
+    answer_cache.set(cache_key, response.model_copy(deep=True))
+
+
 def _remove_uploaded_file(path: Path, request_id: str) -> None:
     try:
         path.unlink(missing_ok=True)
@@ -681,11 +728,14 @@ def _submit_index_job(
 
 @app.get("/health")
 async def health() -> dict[str, bool | str | int | float]:
+    circuit = provider_circuit.snapshot()
     return {
         "status": "ok",
         "rag_ready": retriever is not None and llm is not None,
         "top_k": RAG_TOP_K,
         "min_relevance_score": RAG_MIN_RELEVANCE_SCORE,
+        "answer_cache_enabled": answer_cache.enabled,
+        "provider_circuit_state": circuit.state,
         "data_dir": DATA_DIR,
         "vector_store": CHROMA_DB_DIR,
         "pdf_count": len(list_pdf_files(DATA_DIR)),
@@ -790,6 +840,22 @@ def ask_question(query: QueryRequest, request: Request) -> QueryResponse:
             detail="RAG service is not configured. Set GOOGLE_API_KEY before using /ask.",
         )
 
+    cache_key = _answer_cache_key(query.question)
+    cached_response = answer_cache.get(cache_key)
+    if cached_response is not None:
+        logger.info(
+            "rag_cache_hit request_id=%s question_chars=%s",
+            _request_id(request),
+            len(query.question),
+        )
+        return cached_response.model_copy(deep=True)
+
+    logger.info(
+        "rag_cache_miss request_id=%s question_chars=%s",
+        _request_id(request),
+        len(query.question),
+    )
+    generation_started = False
     try:
         retrieval_start = time.perf_counter()
         retrieval = retriever.retrieve(query.question)
@@ -810,8 +876,25 @@ def ask_question(query: QueryRequest, request: Request) -> QueryResponse:
                 retrieval_ms,
                 total_ms,
             )
-            return QueryResponse(answer=NO_CONTEXT_ANSWER, sources=[])
+            response = QueryResponse(answer=NO_CONTEXT_ANSWER, sources=[])
+            _cache_response(cache_key, response)
+            return response
 
+        try:
+            provider_circuit.before_call()
+        except CircuitOpenError as exc:
+            logger.warning(
+                "rag_provider_circuit_rejected request_id=%s retry_after=%s",
+                _request_id(request),
+                exc.retry_after,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="The model provider is temporarily unavailable.",
+                headers={"Retry-After": str(exc.retry_after)},
+            ) from exc
+
+        generation_started = True
         llm_start = time.perf_counter()
         chain = prompt | llm | StrOutputParser()
         answer = ensure_source_markers(
@@ -839,22 +922,33 @@ def ask_question(query: QueryRequest, request: Request) -> QueryResponse:
             llm_ms,
             total_ms,
         )
-        return QueryResponse(answer=answer, sources=build_sources(docs))
+        response = QueryResponse(answer=answer, sources=build_sources(docs))
+        provider_circuit.record_success()
+        _cache_response(cache_key, response)
+        return response
     except Exception as exc:
+        if isinstance(exc, HTTPException):
+            raise
+
         provider_status = _provider_status_code(exc)
         if provider_status in {429, 500, 502, 503, 504}:
+            if generation_started:
+                provider_circuit.record_failure()
+            circuit = provider_circuit.snapshot()
+            retry_after = circuit.retry_after or 5
             logger.warning(
                 "rag_question_answered status=provider_unavailable request_id=%s "
-                "provider_status=%s question_chars=%s total_ms=%s",
+                "provider_status=%s circuit_state=%s question_chars=%s total_ms=%s",
                 _request_id(request),
                 provider_status,
+                circuit.state,
                 len(query.question),
                 _elapsed_ms(request_start),
             )
             raise HTTPException(
                 status_code=503,
                 detail="The model provider is temporarily unavailable.",
-                headers={"Retry-After": "5"},
+                headers={"Retry-After": str(retry_after)},
             ) from exc
 
         logger.exception(

@@ -65,7 +65,7 @@ The sidebar supports document discovery, PDF upload, and manual reindexing:
 
 ## Tradeoffs
 
-- ChromaDB keeps the prototype simple: it runs locally, persists embeddings on
+- ChromaDB keeps the local setup simple: it runs locally, persists embeddings on
   disk, and avoids external database setup while still showing real vector
   retrieval behavior.
 - Google Gemini is used for both embeddings and answer generation to keep the
@@ -80,6 +80,8 @@ The sidebar supports document discovery, PDF upload, and manual reindexing:
   ingress-level rate limiter.
 - Index jobs run in a bounded, process-local worker queue. This keeps local
   requests responsive, but production deployments need a durable shared queue.
+- The response cache and provider circuit breaker are also process-local. A
+  multi-instance deployment needs shared cache and circuit state.
 - Relevance scores are retrieval heuristics, not calibrated confidence
   probabilities. The cutoff should be tuned against representative evaluation
   questions whenever the documents or embedding model change.
@@ -111,6 +113,10 @@ The sidebar supports document discovery, PDF upload, and manual reindexing:
 - Logs request timing, retrieval timing, LLM timing, and indexing metrics.
 - Runs blocking embedding and chat calls in FastAPI's worker threadpool and
   bounds Gemini request duration and retries.
+- Caches repeated answers by question, active index revision, model, and
+  retrieval settings to avoid unnecessary provider calls.
+- Opens a temporary provider circuit after repeated transient failures and
+  allows one half-open recovery probe after the cooldown.
 - Keeps secrets out of tracked code and Docker build context.
 
 ## Current Scope
@@ -136,6 +142,7 @@ Current hardening work includes:
 - Bounded, parser-validated PDF uploads and concurrent rebuild protection.
 - Bounded background indexing jobs with queued, running, completed, and failed
   states.
+- TTL/LRU answer caching and quota-aware provider circuit breaking.
 
 Planned improvements:
 
@@ -144,6 +151,7 @@ Planned improvements:
   deployments.
 - Replace process-local index jobs with a durable shared queue for
   multi-instance deployments.
+- Add a pluggable generation-provider interface and optional local fallback.
 
 ## Local Setup
 
@@ -205,6 +213,10 @@ defaults to `0.65`. Reindex once after upgrading so the active collection uses
 cosine distance consistently.
 `GEMINI_REQUEST_TIMEOUT_SECONDS` defaults to `45`, and `GEMINI_MAX_RETRIES`
 defaults to `1`, keeping upstream failures within the frontend request window.
+`RAG_CACHE_TTL_SECONDS=300` and `RAG_CACHE_MAX_ENTRIES=256` configure the
+process-local answer cache; set either to `0` to disable it.
+`RAG_CIRCUIT_FAILURE_THRESHOLD=3` and `RAG_CIRCUIT_RECOVERY_SECONDS=60`
+configure the provider circuit breaker.
 
 ## Demo Script
 
@@ -428,6 +440,10 @@ The API logs structured events for the important paths:
 - `rag_index_job_failed`: job ID, operation, safe error message, and request ID.
 - `rag_rate_limited`: client key, configured limit, window size, and retry delay
   when a request receives HTTP 429, plus request ID.
+- `rag_cache_hit` and `rag_cache_miss`: whether a provider call was avoided for
+  a question, without logging the question text.
+- `rag_provider_circuit_rejected`: requests rejected during provider cooldown,
+  including the retry delay.
 - `http_request_completed`: method, path, status code, elapsed time, and request
   ID for every API request.
 
@@ -455,3 +471,13 @@ tests and deterministic retrieval checks, and building the Docker image.
 The `terraform/` folder contains an Azure infrastructure draft for the future
 deployment path. Before production use, it should be extended with container
 image settings, secret management, managed identity, and deployment outputs.
+
+## Security
+
+Report suspected vulnerabilities privately as described in
+[`SECURITY.md`](SECURITY.md). Do not include credentials or internal documents
+in public issues.
+
+## License
+
+This project is available under the [MIT License](LICENSE).

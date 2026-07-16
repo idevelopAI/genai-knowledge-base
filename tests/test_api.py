@@ -36,6 +36,8 @@ def make_pdf_bytes(page_count: int = 1) -> bytes:
 def setup_function():
     main.rate_limit_events.clear()
     main.index_job_store.clear()
+    main.answer_cache.clear()
+    main.provider_circuit.reset()
 
 
 def wait_for_terminal_job(job_id: str, timeout: float = 2.0):
@@ -56,6 +58,8 @@ def test_health_is_available_without_api_key():
     assert payload["status"] == "ok"
     assert payload["rag_ready"] is False
     assert payload["min_relevance_score"] == main.RAG_MIN_RELEVANCE_SCORE
+    assert payload["answer_cache_enabled"] is True
+    assert payload["provider_circuit_state"] == "closed"
     assert "pdf_count" in payload
 
 
@@ -168,6 +172,63 @@ def test_ask_maps_transient_provider_failure_to_503(monkeypatch):
     assert response.json()["detail"] == (
         "The model provider is temporarily unavailable."
     )
+
+
+def test_ask_serves_repeated_question_from_cache(monkeypatch):
+    class CountingRetriever:
+        index_revision = "test-index"
+
+        def __init__(self):
+            self.calls = 0
+
+        def retrieve(self, question):
+            self.calls += 1
+            return main.RetrievalResult(
+                documents=[],
+                candidate_count=1,
+                best_candidate_score=0.2,
+            )
+
+    retriever = CountingRetriever()
+    monkeypatch.setattr(main, "retriever", retriever)
+    monkeypatch.setattr(main, "llm", object())
+
+    first = client.post("/ask", json={"question": "Unknown topic"})
+    second = client.post("/ask", json={"question": "Unknown topic"})
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json() == first.json()
+    assert retriever.calls == 1
+
+
+def test_open_provider_circuit_rejects_before_generation(monkeypatch):
+    class RelevantRetriever:
+        index_revision = "test-index"
+
+        def __init__(self):
+            self.calls = 0
+
+        def retrieve(self, question):
+            self.calls += 1
+            return main.RetrievalResult(
+                documents=[Document(page_content="Relevant context", metadata={})],
+                candidate_count=1,
+                best_candidate_score=0.9,
+            )
+
+    retriever = RelevantRetriever()
+    circuit = main.CircuitBreaker(failure_threshold=1, recovery_seconds=30)
+    circuit.record_failure()
+    monkeypatch.setattr(main, "retriever", retriever)
+    monkeypatch.setattr(main, "llm", object())
+    monkeypatch.setattr(main, "provider_circuit", circuit)
+
+    response = client.post("/ask", json={"question": "Known topic"})
+
+    assert response.status_code == 503
+    assert response.headers["Retry-After"]
+    assert retriever.calls == 1
 
 
 def test_relevance_filter_keeps_only_scored_usable_documents():
