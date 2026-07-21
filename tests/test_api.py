@@ -86,7 +86,7 @@ def test_invalid_request_id_is_replaced():
 
 def test_ask_returns_503_when_rag_is_not_configured(monkeypatch):
     monkeypatch.setattr(main, "retriever", None)
-    monkeypatch.setattr(main, "llm", None)
+    monkeypatch.setattr(main, "generation_provider", None)
 
     response = client.post("/ask", json={"question": "What is in the document?"})
 
@@ -106,7 +106,7 @@ def test_ask_requires_bearer_token_when_configured(monkeypatch):
 def test_ask_accepts_bearer_token_when_configured(monkeypatch):
     monkeypatch.setattr(main, "RAG_API_TOKEN", "test-token")
     monkeypatch.setattr(main, "retriever", None)
-    monkeypatch.setattr(main, "llm", None)
+    monkeypatch.setattr(main, "generation_provider", None)
 
     response = client.post(
         "/ask",
@@ -135,7 +135,7 @@ def test_ask_rejects_question_over_length_limit():
 
 def test_ask_returns_without_llm_call_when_retrieval_has_no_context(monkeypatch):
     class EmptyRetriever:
-        def retrieve(self, question):
+        def retrieve(self, question, document_names=None):
             return main.RetrievalResult(
                 documents=[],
                 candidate_count=1,
@@ -143,7 +143,7 @@ def test_ask_returns_without_llm_call_when_retrieval_has_no_context(monkeypatch)
             )
 
     monkeypatch.setattr(main, "retriever", EmptyRetriever())
-    monkeypatch.setattr(main, "llm", object())
+    monkeypatch.setattr(main, "generation_provider", object())
 
     response = client.post("/ask", json={"question": "Unknown topic"})
 
@@ -159,11 +159,11 @@ def test_ask_maps_transient_provider_failure_to_503(monkeypatch):
         status_code = 503
 
     class FailingRetriever:
-        def retrieve(self, question):
+        def retrieve(self, question, document_names=None):
             raise ProviderUnavailable("temporary upstream failure")
 
     monkeypatch.setattr(main, "retriever", FailingRetriever())
-    monkeypatch.setattr(main, "llm", object())
+    monkeypatch.setattr(main, "generation_provider", object())
 
     response = client.post("/ask", json={"question": "Known topic"})
 
@@ -181,7 +181,7 @@ def test_ask_serves_repeated_question_from_cache(monkeypatch):
         def __init__(self):
             self.calls = 0
 
-        def retrieve(self, question):
+        def retrieve(self, question, document_names=None):
             self.calls += 1
             return main.RetrievalResult(
                 documents=[],
@@ -191,7 +191,7 @@ def test_ask_serves_repeated_question_from_cache(monkeypatch):
 
     retriever = CountingRetriever()
     monkeypatch.setattr(main, "retriever", retriever)
-    monkeypatch.setattr(main, "llm", object())
+    monkeypatch.setattr(main, "generation_provider", object())
 
     first = client.post("/ask", json={"question": "Unknown topic"})
     second = client.post("/ask", json={"question": "Unknown topic"})
@@ -209,7 +209,7 @@ def test_open_provider_circuit_rejects_before_generation(monkeypatch):
         def __init__(self):
             self.calls = 0
 
-        def retrieve(self, question):
+        def retrieve(self, question, document_names=None):
             self.calls += 1
             return main.RetrievalResult(
                 documents=[Document(page_content="Relevant context", metadata={})],
@@ -221,7 +221,7 @@ def test_open_provider_circuit_rejects_before_generation(monkeypatch):
     circuit = main.CircuitBreaker(failure_threshold=1, recovery_seconds=30)
     circuit.record_failure()
     monkeypatch.setattr(main, "retriever", retriever)
-    monkeypatch.setattr(main, "llm", object())
+    monkeypatch.setattr(main, "generation_provider", object())
     monkeypatch.setattr(main, "provider_circuit", circuit)
 
     response = client.post("/ask", json={"question": "Known topic"})
@@ -242,7 +242,7 @@ def test_relevance_filter_keeps_only_scored_usable_documents():
     )
 
     class ScoredVectorStore:
-        def similarity_search_with_relevance_scores(self, question, k):
+        def similarity_search_with_relevance_scores(self, question, k, **kwargs):
             assert question == "test question"
             assert k == 3
             return [
@@ -268,7 +268,7 @@ def test_relevance_filter_rejects_non_finite_scores():
     document = Document(page_content="Context", metadata={})
 
     class InvalidScoreVectorStore:
-        def similarity_search_with_relevance_scores(self, question, k):
+        def similarity_search_with_relevance_scores(self, question, k, **kwargs):
             return [(document, float("nan")), (document, 1.2)]
 
     retriever = main.RelevanceFilteringRetriever(
@@ -281,6 +281,191 @@ def test_relevance_filter_rejects_non_finite_scores():
 
     assert result.documents == []
     assert result.best_candidate_score is None
+
+
+@pytest.mark.parametrize(
+    ("document_names", "expected_filter"),
+    [
+        (["guide.pdf"], {"source_name": "guide.pdf"}),
+        (
+            ["guide.pdf", "policy.pdf"],
+            {"source_name": {"$in": ["guide.pdf", "policy.pdf"]}},
+        ),
+    ],
+)
+def test_retriever_applies_document_metadata_filter(
+    document_names,
+    expected_filter,
+):
+    captured = {}
+
+    class FilteredVectorStore:
+        def similarity_search_with_relevance_scores(self, question, **kwargs):
+            captured.update(kwargs)
+            return []
+
+    retriever = main.RelevanceFilteringRetriever(
+        FilteredVectorStore(),
+        top_k=3,
+        min_score=0.5,
+    )
+
+    retriever.retrieve("test", document_names)
+
+    assert captured == {"k": 3, "filter": expected_filter}
+
+
+def test_ask_passes_validated_document_selection_to_retriever(
+    tmp_path,
+    monkeypatch,
+):
+    (tmp_path / "guide.pdf").write_bytes(b"%PDF-1.4\n")
+    captured = {}
+
+    class CapturingRetriever:
+        index_revision = "test-index"
+
+        def retrieve(self, question, document_names=None):
+            captured["document_names"] = document_names
+            return main.RetrievalResult([], 0, None)
+
+    monkeypatch.setattr(main, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "retriever", CapturingRetriever())
+    monkeypatch.setattr(main, "generation_provider", object())
+
+    response = client.post(
+        "/ask",
+        json={"question": "Known topic", "documents": ["guide.pdf"]},
+    )
+
+    assert response.status_code == 200
+    assert captured["document_names"] == ["guide.pdf"]
+
+
+def test_ask_rejects_unknown_or_unsafe_document_selection(tmp_path, monkeypatch):
+    (tmp_path / "guide.pdf").write_bytes(b"%PDF-1.4\n")
+    monkeypatch.setattr(main, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "retriever", object())
+    monkeypatch.setattr(main, "generation_provider", object())
+
+    unknown = client.post(
+        "/ask",
+        json={"question": "Known topic", "documents": ["missing.pdf"]},
+    )
+    unsafe = client.post(
+        "/ask",
+        json={"question": "Known topic", "documents": ["../guide.pdf"]},
+    )
+
+    assert unknown.status_code == 422
+    assert unsafe.status_code == 422
+
+
+def test_answer_cache_is_scoped_to_document_selection(tmp_path, monkeypatch):
+    for filename in ("guide.pdf", "policy.pdf"):
+        (tmp_path / filename).write_bytes(b"%PDF-1.4\n")
+
+    class CountingRetriever:
+        index_revision = "test-index"
+
+        def __init__(self):
+            self.calls = 0
+
+        def retrieve(self, question, document_names=None):
+            self.calls += 1
+            return main.RetrievalResult([], 0, None)
+
+    retriever = CountingRetriever()
+    monkeypatch.setattr(main, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "retriever", retriever)
+    monkeypatch.setattr(main, "generation_provider", object())
+
+    client.post(
+        "/ask",
+        json={"question": "Same question", "documents": ["guide.pdf"]},
+    )
+    client.post(
+        "/ask",
+        json={"question": "Same question", "documents": ["policy.pdf"]},
+    )
+
+    assert retriever.calls == 2
+
+
+def test_transient_primary_failure_uses_ollama_fallback(monkeypatch):
+    class ProviderUnavailable(Exception):
+        status_code = 429
+
+    class RelevantRetriever:
+        index_revision = "test-index"
+
+        def retrieve(self, question, document_names=None):
+            return main.RetrievalResult(
+                [Document(page_content="Relevant context", metadata={})],
+                1,
+                0.9,
+            )
+
+    class FailingPrimary:
+        name = "gemini"
+        model = "test-gemini"
+
+        def generate(self, **kwargs):
+            raise ProviderUnavailable("quota exceeded")
+
+    class WorkingFallback:
+        name = "ollama"
+        model = "test-ollama"
+
+        def generate(self, **kwargs):
+            return "Local answer."
+
+    monkeypatch.setattr(main, "retriever", RelevantRetriever())
+    monkeypatch.setattr(main, "generation_provider", FailingPrimary())
+    monkeypatch.setattr(main, "fallback_provider", WorkingFallback())
+
+    response = client.post("/ask", json={"question": "Known topic"})
+
+    assert response.status_code == 200
+    assert response.json()["answer"] == "Local answer.\n\nQuellen: [Source 1]"
+
+
+def test_open_primary_circuit_uses_configured_fallback(monkeypatch):
+    class RelevantRetriever:
+        index_revision = "test-index"
+
+        def retrieve(self, question, document_names=None):
+            return main.RetrievalResult(
+                [Document(page_content="Relevant context", metadata={})],
+                1,
+                0.9,
+            )
+
+    class UnusedPrimary:
+        name = "gemini"
+        model = "test-gemini"
+
+        def generate(self, **kwargs):
+            raise AssertionError("Primary provider must not be called")
+
+    class WorkingFallback:
+        name = "ollama"
+        model = "test-ollama"
+
+        def generate(self, **kwargs):
+            return "Local answer [Source 1]."
+
+    circuit = main.CircuitBreaker(failure_threshold=1, recovery_seconds=30)
+    circuit.record_failure()
+    monkeypatch.setattr(main, "retriever", RelevantRetriever())
+    monkeypatch.setattr(main, "generation_provider", UnusedPrimary())
+    monkeypatch.setattr(main, "fallback_provider", WorkingFallback())
+    monkeypatch.setattr(main, "provider_circuit", circuit)
+
+    response = client.post("/ask", json={"question": "Known topic"})
+
+    assert response.status_code == 200
+    assert response.json()["answer"] == "Local answer [Source 1]."
 
 
 def test_list_documents_returns_pdf_names(tmp_path, monkeypatch):
@@ -419,6 +604,82 @@ def test_upload_removes_saved_file_when_indexing_fails(tmp_path, monkeypatch):
     assert job["status"] == "failed"
     assert job["error"] == "index failed"
     assert list(tmp_path.glob("*.pdf")) == []
+
+
+def test_delete_document_reindexes_and_removes_backup(tmp_path, monkeypatch):
+    target = tmp_path / "remove.pdf"
+    target.write_bytes(make_pdf_bytes())
+    (tmp_path / "keep.pdf").write_bytes(make_pdf_bytes())
+    monkeypatch.setattr(main, "GOOGLE_API_KEY", "configured-for-test")
+    monkeypatch.setattr(main, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        main,
+        "_rebuild_vector_store",
+        lambda **kwargs: IndexStats(
+            pdf_count=1,
+            pages_loaded=1,
+            chunks_created=1,
+            data_dir=str(tmp_path),
+            vector_store="chroma",
+            collection_name="documents-test",
+        ),
+    )
+
+    response = client.delete("/documents/remove.pdf")
+
+    assert response.status_code == 202
+    job = wait_for_terminal_job(response.json()["job_id"])
+    assert job["status"] == "completed"
+    assert job["operation"] == "delete"
+    assert job["result"]["status"] == "deleted_and_indexed"
+    assert target.exists() is False
+    assert list(tmp_path.glob(".*.deleting")) == []
+
+
+def test_delete_document_restores_file_when_reindexing_fails(
+    tmp_path,
+    monkeypatch,
+):
+    target = tmp_path / "remove.pdf"
+    target.write_bytes(make_pdf_bytes())
+    (tmp_path / "keep.pdf").write_bytes(make_pdf_bytes())
+    monkeypatch.setattr(main, "GOOGLE_API_KEY", "configured-for-test")
+    monkeypatch.setattr(main, "DATA_DIR", str(tmp_path))
+
+    def fail_rebuild(**kwargs):
+        raise main.HTTPException(status_code=500, detail="index failed")
+
+    monkeypatch.setattr(main, "_rebuild_vector_store", fail_rebuild)
+
+    response = client.delete("/documents/remove.pdf")
+
+    job = wait_for_terminal_job(response.json()["job_id"])
+    assert job["status"] == "failed"
+    assert target.exists() is True
+    assert list(tmp_path.glob(".*.deleting")) == []
+
+
+def test_delete_document_rejects_last_document(tmp_path, monkeypatch):
+    (tmp_path / "only.pdf").write_bytes(make_pdf_bytes())
+    monkeypatch.setattr(main, "GOOGLE_API_KEY", "configured-for-test")
+    monkeypatch.setattr(main, "DATA_DIR", str(tmp_path))
+
+    response = client.delete("/documents/only.pdf")
+
+    assert response.status_code == 409
+    assert (tmp_path / "only.pdf").exists()
+
+
+def test_delete_document_requires_token_when_configured(tmp_path, monkeypatch):
+    (tmp_path / "remove.pdf").write_bytes(make_pdf_bytes())
+    (tmp_path / "keep.pdf").write_bytes(make_pdf_bytes())
+    monkeypatch.setattr(main, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "RAG_API_TOKEN", "test-token")
+
+    response = client.delete("/documents/remove.pdf")
+
+    assert response.status_code == 401
+    assert (tmp_path / "remove.pdf").exists()
 
 
 def test_rebuild_rejects_concurrent_indexing(monkeypatch):

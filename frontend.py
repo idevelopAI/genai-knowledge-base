@@ -1,5 +1,6 @@
 import os
 import time
+from urllib.parse import quote
 
 import requests
 import streamlit as st
@@ -9,6 +10,41 @@ st.set_page_config(
     page_title="GenAI Wissensdatenbank",
     page_icon="🤖",
     layout="wide",
+)
+st.markdown(
+    """
+    <style>
+    h1 {
+        font-size: 40px !important;
+        line-height: 1.2 !important;
+        letter-spacing: 0 !important;
+    }
+    @media (min-width: 769px) {
+        section[data-testid="stSidebar"] {
+            width: 360px !important;
+        }
+        section[data-testid="stSidebar"] > div {
+            width: 360px !important;
+        }
+    }
+    @media (max-width: 768px) {
+        [data-testid="stMainBlockContainer"] {
+            box-sizing: border-box !important;
+            max-width: 100% !important;
+            padding-left: 16px !important;
+            padding-right: 16px !important;
+        }
+        h1 {
+            font-size: 24px !important;
+            overflow-wrap: anywhere !important;
+        }
+        [data-testid="stMainBlockContainer"] p {
+            overflow-wrap: anywhere !important;
+        }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 st.title("🤖 Interaktive Wissensdatenbank")
@@ -78,6 +114,8 @@ def wait_for_index_job(job, timeout=180):
 
 with st.sidebar:
     st.header("Dokumente")
+    if operation_message := st.session_state.pop("document_operation_message", None):
+        st.success(operation_message)
 
     documents = refresh_document_list()
     if documents:
@@ -85,6 +123,49 @@ with st.sidebar:
             st.caption(document)
     else:
         st.caption("Keine Dokumente gefunden oder Backend nicht erreichbar.")
+
+    current_selection = st.session_state.get("selected_documents", documents)
+    st.session_state.selected_documents = [
+        document for document in current_selection if document in documents
+    ]
+    if documents and not st.session_state.selected_documents:
+        st.session_state.selected_documents = documents
+
+    selected_documents = st.multiselect(
+        "Dokumentauswahl",
+        options=documents,
+        key="selected_documents",
+        disabled=not documents,
+    )
+
+    document_to_delete = st.selectbox(
+        "Dokument loeschen",
+        options=documents,
+        index=None,
+        placeholder="PDF auswaehlen",
+        disabled=len(documents) <= 1,
+    )
+    if st.button(
+        "Ausgewaehltes Dokument loeschen",
+        disabled=document_to_delete is None or len(documents) <= 1,
+    ):
+        with st.spinner("Dokument wird geloescht und der Index aktualisiert..."):
+            try:
+                response = requests.delete(
+                    f"{DOCUMENTS_URL}/{quote(document_to_delete, safe='')}",
+                    headers=auth_headers(),
+                    timeout=30,
+                )
+                response.raise_for_status()
+                payload = wait_for_index_job(response.json())
+                st.session_state.document_operation_message = (
+                    "Dokument geloescht: "
+                    f"{payload['pdf_count']} PDFs, {payload['chunks_created']} Chunks."
+                )
+                st.session_state.messages = []
+                st.rerun()
+            except (requests.exceptions.RequestException, RuntimeError) as e:
+                st.error(f"Loeschen fehlgeschlagen: {str(e)}")
 
     uploaded_file = st.file_uploader("PDF hochladen", type=["pdf"])
     if st.button("Hochladen und indexieren", disabled=uploaded_file is None):
@@ -105,11 +186,12 @@ with st.sidebar:
                 )
                 response.raise_for_status()
                 payload = wait_for_index_job(response.json())
-                st.success(
+                st.session_state.document_operation_message = (
                     "Index aktualisiert: "
                     f"{payload['pdf_count']} PDFs, {payload['chunks_created']} Chunks."
                 )
                 st.session_state.messages = []
+                st.rerun()
             except (requests.exceptions.RequestException, RuntimeError) as e:
                 st.error(f"Upload fehlgeschlagen: {str(e)}")
 
@@ -123,11 +205,12 @@ with st.sidebar:
                 )
                 response.raise_for_status()
                 payload = wait_for_index_job(response.json())
-                st.success(
+                st.session_state.document_operation_message = (
                     "Index aktualisiert: "
                     f"{payload['pdf_count']} PDFs, {payload['chunks_created']} Chunks."
                 )
                 st.session_state.messages = []
+                st.rerun()
             except (requests.exceptions.RequestException, RuntimeError) as e:
                 st.error(f"Reindex fehlgeschlagen: {str(e)}")
 
@@ -140,7 +223,11 @@ for message in st.session_state.messages:
         st.markdown(message["content"])
         render_sources(message.get("sources", []))
 
-if prompt := st.chat_input("Deine Frage an das Dokument..."):
+chat_disabled = not documents or not selected_documents
+if prompt := st.chat_input(
+    "Deine Frage an die ausgewaehlten Dokumente...",
+    disabled=chat_disabled,
+):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
@@ -152,7 +239,7 @@ if prompt := st.chat_input("Deine Frage an das Dokument..."):
         try:
             response = requests.post(
                 API_URL,
-                json={"question": prompt},
+                json={"question": prompt, "documents": selected_documents},
                 headers=auth_headers(),
                 timeout=60,
             )

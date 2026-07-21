@@ -6,6 +6,9 @@ __pycache__/
 .env.*
 .git/
 .github/
+data/*
+!data/sample_document.pdf
+!data/Gartenpflege_Leitfaden.pdf
 chroma_db/
 .pytest_cache/
 .mypy_cache/

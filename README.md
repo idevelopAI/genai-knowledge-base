@@ -31,15 +31,21 @@ flowchart LR
     Embeddings --> Chroma["ChromaDB vector store"]
 
     User["User in Streamlit UI"] --> API["FastAPI backend"]
+    User --> Selection["Document selection"]
+    Selection --> API
     API --> Retriever["Retriever top-k chunks"]
     Retriever --> Chroma
+    Retriever --> Metadata["Chroma source_name filter"]
     Retriever --> Filter["Minimum relevance score"]
     Filter --> Prompt["Grounded prompt with context"]
     Prompt --> LLM["Gemini chat model"]
+    LLM -. transient failure .-> Ollama["Optional local Ollama fallback"]
     LLM --> Answer["Answer with source citations"]
+    Ollama --> Answer
     Answer --> User
 
     Upload["PDF upload / reindex"] --> API
+    Delete["PDF deletion"] --> API
     API --> Jobs["Bounded index job queue"]
     Jobs --> Worker["Background index worker"]
     Worker --> Loader
@@ -58,7 +64,7 @@ The sidebar supports document discovery, PDF upload, and manual reindexing:
 ## Tech Stack
 
 - Backend: Python, FastAPI, Pydantic
-- RAG: pypdf, LangChain integrations, ChromaDB, Google Gemini
+- RAG: pypdf, LangChain integrations, ChromaDB, Google Gemini, optional Ollama
 - Frontend: Streamlit
 - DevOps: Docker, GitHub Actions
 - Infrastructure: Terraform for an Azure deployment draft
@@ -90,6 +96,10 @@ The sidebar supports document discovery, PDF upload, and manual reindexing:
 
 - Ingests PDFs from the local `data/` folder.
 - Supports PDF upload and reindexing from the Streamlit UI.
+- Supports selecting one or more PDFs to constrain retrieval through Chroma
+  metadata filters.
+- Deletes PDFs through an authenticated background job and restores the file if
+  reindexing fails.
 - Validates PDF structure and enforces configurable file-size and page limits.
 - Stores document chunks in a local ChromaDB vector database.
 - Rebuilds indexes through versioned collections so a failed build does not
@@ -117,6 +127,8 @@ The sidebar supports document discovery, PDF upload, and manual reindexing:
   retrieval settings to avoid unnecessary provider calls.
 - Opens a temporary provider circuit after repeated transient failures and
   allows one half-open recovery probe after the cooldown.
+- Uses a small generation-provider interface with Gemini as the primary provider
+  and an optional local Ollama fallback for transient generation failures.
 - Keeps secrets out of tracked code and Docker build context.
 
 ## Current Scope
@@ -143,6 +155,8 @@ Current hardening work includes:
 - Bounded background indexing jobs with queued, running, completed, and failed
   states.
 - TTL/LRU answer caching and quota-aware provider circuit breaking.
+- Document-scoped retrieval, transactional document deletion, and optional
+  local answer-generation fallback.
 
 Planned improvements:
 
@@ -151,7 +165,6 @@ Planned improvements:
   deployments.
 - Replace process-local index jobs with a durable shared queue for
   multi-instance deployments.
-- Add a pluggable generation-provider interface and optional local fallback.
 
 ## Local Setup
 
@@ -201,8 +214,10 @@ Start the frontend in a second terminal:
 streamlit run frontend.py
 ```
 
-The Streamlit sidebar lets you upload a PDF, rebuild the index, and see the
-documents currently available to the backend.
+The Streamlit sidebar lets you select documents for a question, upload or delete
+a PDF, rebuild the index, and see the documents currently available to the
+backend. At least one PDF is retained so the active knowledge base never points
+to an empty index.
 
 PDF uploads default to a 10 MiB file limit and a 200-page limit. Override them
 with `RAG_MAX_UPLOAD_BYTES` and `RAG_MAX_PDF_PAGES`.
@@ -217,6 +232,32 @@ defaults to `1`, keeping upstream failures within the frontend request window.
 process-local answer cache; set either to `0` to disable it.
 `RAG_CIRCUIT_FAILURE_THRESHOLD=3` and `RAG_CIRCUIT_RECOVERY_SECONDS=60`
 configure the provider circuit breaker.
+`RAG_MAX_SELECTED_DOCUMENTS=100` bounds the document filter accepted by `/ask`.
+After upgrading an existing checkout, run one reindex so every chunk receives
+the `source_name` metadata used by document selection.
+
+### Optional Ollama fallback
+
+Ollama can answer locally when Gemini generation returns a transient `429` or
+`5xx` error, or while the Gemini circuit is open. Gemini remains the primary
+provider, and Gemini embeddings are still required for retrieval and indexing.
+
+Install Ollama separately, pull a chat model, and enable the fallback in your
+local `.env`:
+
+```bash
+ollama pull gemma3:4b
+```
+
+```text
+RAG_OLLAMA_FALLBACK_ENABLED=true
+OLLAMA_CHAT_MODEL=gemma3:4b
+OLLAMA_BASE_URL=http://127.0.0.1:11434
+```
+
+When the backend runs through Docker Compose, use
+`OLLAMA_BASE_URL=http://host.docker.internal:11434` instead. Prompts, document
+text, and model responses are not written to application logs.
 
 ## Demo Script
 
@@ -224,15 +265,17 @@ After starting the app, try this flow:
 
 1. Open `http://localhost:8501`.
 2. Confirm the sidebar lists the PDFs from `data/`.
-3. Ask this German sample question: `Welche Informationen stehen im Dokument?`
+3. Select one or more PDFs and ask this German sample question:
+   `Welche Informationen stehen im Dokument?`
 4. Expand the German `Quellen` section under the answer and check the source
    filename/page.
 5. Upload another PDF from the sidebar, click the German
    `Hochladen und indexieren` button, then ask a question about the new
    document.
-6. Run `python evals/run_retrieval_eval.py` for credential-free retrieval
+6. Delete the uploaded PDF and confirm the background reindex completes.
+7. Run `python evals/run_retrieval_eval.py` for credential-free retrieval
    checks.
-7. Run `python evals/run_eval.py` while the backend is running for live RAG
+8. Run `python evals/run_eval.py` while the backend is running for live RAG
    checks.
 
 ## Docker
@@ -339,7 +382,7 @@ Ask a German sample question:
 ```bash
 curl -X POST http://127.0.0.1:8000/ask \
   -H "Content-Type: application/json" \
-  -d '{"question": "Welche Informationen stehen im Dokument?"}'
+  -d '{"question": "Welche Informationen stehen im Dokument?", "documents": ["sample_document.pdf"]}'
 ```
 
 List available documents:
@@ -353,6 +396,12 @@ Upload and index a PDF:
 ```bash
 curl -X POST http://127.0.0.1:8000/documents \
   -F "file=@data/sample_document.pdf"
+```
+
+Delete a PDF and rebuild the remaining index:
+
+```bash
+curl -X DELETE http://127.0.0.1:8000/documents/sample_document.pdf
 ```
 
 Rebuild the index from all PDFs in `data/`:
@@ -408,12 +457,15 @@ in public issues.
 - Real secrets must stay in local environment variables or `.env`.
 - `.env` and `.env.*` are ignored by Git and Docker.
 - `example.env` contains placeholder values only.
+- Local additions under `data/` are ignored by Git and excluded from Docker
+  builds; only the two explicit sample PDFs are allowlisted.
 - Set `RAG_API_TOKEN` to require bearer-token access for `/ask`, `/documents`,
   `/reindex`, and `/jobs/{job_id}`.
 - `RAG_RATE_LIMIT_REQUESTS` and `RAG_RATE_LIMIT_WINDOW_SECONDS` limit repeated
   calls to `/ask`, `/documents`, and `/reindex`.
 - `RAG_MAX_UPLOAD_BYTES` and `RAG_MAX_PDF_PAGES` bound uploaded PDF processing.
-- Uploaded files are parser-validated and removed if indexing fails.
+- Uploaded files are parser-validated and removed if indexing fails. Deleted
+  files are restored if the replacement index cannot be built.
 - Index rebuilds activate a new version only after embedding succeeds; the
   previous collection remains active on failure.
 - API errors avoid returning raw internal exception text to users.
@@ -421,6 +473,8 @@ in public issues.
   instead of being reported as internal application failures.
 - Questions are trimmed, reject blank input, and are limited to 2,000
   characters.
+- Document filters accept only exact filenames currently present in `data/` and
+  are bounded by `RAG_MAX_SELECTED_DOCUMENTS`.
 - Retrieved document instructions are explicitly treated as untrusted data;
   empty retrieval results return a deterministic refusal without an LLM call.
 - Low-scoring retrieval results are excluded before prompt construction.
@@ -441,6 +495,8 @@ The API logs structured events for the important paths:
   time, plus request ID when triggered through the API.
 - `rag_document_uploaded`: saved filename, upload size, page count, resulting
   PDF count, chunk count, total upload/index time, and request ID.
+- `rag_document_deleted`: deleted filename, resulting PDF and chunk counts,
+  elapsed time, and request ID.
 - `rag_index_job_failed`: job ID, operation, safe error message, and request ID.
 - `rag_rate_limited`: client key, configured limit, window size, and retry delay
   when a request receives HTTP 429, plus request ID.
@@ -448,6 +504,8 @@ The API logs structured events for the important paths:
   a question, without logging the question text.
 - `rag_provider_circuit_rejected`: requests rejected during provider cooldown,
   including the retry delay.
+- `rag_provider_fallback_used`: whether Ollama handled generation because the
+  primary provider failed or its circuit was open.
 - `http_request_completed`: method, path, status code, elapsed time, and request
   ID for every API request.
 

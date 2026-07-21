@@ -8,6 +8,9 @@ chroma_db/
 .ruff_cache/
 *.pyc
 .DS_Store
+data/*
+!data/sample_document.pdf
+!data/Gartenpflege_Leitfaden.pdf
 terraform/.terraform/
 terraform/*.tfstate
 terraform/*.tfstate.*

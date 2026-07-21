@@ -28,7 +28,19 @@ class IndexStats:
 
 
 def list_pdf_files(data_dir: str) -> list[Path]:
-    return sorted(Path(data_dir).glob("*.pdf"))
+    directory = Path(data_dir)
+    if not directory.is_dir():
+        return []
+    return sorted(
+        (
+            path
+            for path in directory.iterdir()
+            if path.is_file()
+            and not path.is_symlink()
+            and path.suffix.lower() == ".pdf"
+        ),
+        key=lambda path: path.name,
+    )
 
 
 def sanitize_filename(filename: str) -> str:
@@ -106,6 +118,7 @@ def load_pdf_documents(pdf_files: list[Path]) -> list[Document]:
                         page_content=page.extract_text() or "",
                         metadata={
                             "source": str(pdf_path),
+                            "source_name": pdf_path.name,
                             "page": page_number,
                         },
                     )

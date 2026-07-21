@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from fastapi import (
     Depends,
@@ -25,11 +26,15 @@ from fastapi import (
 )
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
-from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from pydantic import BaseModel, Field, field_validator
 
+from generation_providers import (
+    GeminiGenerationProvider,
+    GenerationProvider,
+    OllamaGenerationProvider,
+)
 from index_jobs import IndexJobStore, JobCapacityError
 from reliability import CircuitBreaker, CircuitOpenError, TTLCache
 from rag_index import (
@@ -38,6 +43,7 @@ from rag_index import (
     delete_collection,
     get_active_collection_name,
     list_pdf_files,
+    sanitize_filename,
     save_pdf_bytes,
     set_active_collection_name,
     validate_pdf_bytes,
@@ -93,6 +99,31 @@ def _unit_float_from_env(name: str, default: float) -> float:
     return value
 
 
+def _bool_from_env(name: str, default: bool = False) -> bool:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+
+    logger.warning("Invalid %s=%r; using %s", name, raw_value, default)
+    return default
+
+
+def _http_url_from_env(name: str, default: str) -> str:
+    raw_value = os.environ.get(name, default).strip().rstrip("/")
+    parsed = urlparse(raw_value)
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        return raw_value
+
+    logger.warning("Invalid %s; using %s", name, default)
+    return default
+
+
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 RAG_API_TOKEN = os.environ.get("RAG_API_TOKEN")
 DATA_DIR = os.environ.get("DATA_DIR", "./data")
@@ -108,6 +139,10 @@ RAG_MAX_UPLOAD_BYTES = _positive_int_from_env(
 )
 RAG_MAX_PDF_PAGES = _positive_int_from_env("RAG_MAX_PDF_PAGES", 200)
 RAG_MAX_INDEX_JOBS = _positive_int_from_env("RAG_MAX_INDEX_JOBS", 100)
+RAG_MAX_SELECTED_DOCUMENTS = _positive_int_from_env(
+    "RAG_MAX_SELECTED_DOCUMENTS",
+    100,
+)
 RAG_RATE_LIMIT_REQUESTS = _non_negative_int_from_env("RAG_RATE_LIMIT_REQUESTS", 60)
 RAG_RATE_LIMIT_WINDOW_SECONDS = _positive_int_from_env(
     "RAG_RATE_LIMIT_WINDOW_SECONDS", 60
@@ -131,6 +166,16 @@ GEMINI_REQUEST_TIMEOUT_SECONDS = _positive_int_from_env(
     45,
 )
 GEMINI_MAX_RETRIES = _non_negative_int_from_env("GEMINI_MAX_RETRIES", 1)
+RAG_OLLAMA_FALLBACK_ENABLED = _bool_from_env("RAG_OLLAMA_FALLBACK_ENABLED")
+OLLAMA_BASE_URL = _http_url_from_env(
+    "OLLAMA_BASE_URL",
+    "http://127.0.0.1:11434",
+)
+OLLAMA_CHAT_MODEL = os.environ.get("OLLAMA_CHAT_MODEL", "gemma3:4b")
+OLLAMA_REQUEST_TIMEOUT_SECONDS = _positive_int_from_env(
+    "OLLAMA_REQUEST_TIMEOUT_SECONDS",
+    60,
+)
 REQUEST_ID_HEADER = "X-Request-ID"
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 SOURCE_MARKER_PATTERN = re.compile(r"\[Source (\d+)\]", re.IGNORECASE)
@@ -149,6 +194,7 @@ index_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rag-index
 
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=MAX_QUESTION_LENGTH)
+    documents: list[str] | None = Field(default=None)
 
     @field_validator("question")
     @classmethod
@@ -156,6 +202,34 @@ class QueryRequest(BaseModel):
         normalized = value.strip()
         if not normalized:
             raise ValueError("Question must not be blank.")
+        return normalized
+
+    @field_validator("documents")
+    @classmethod
+    def normalize_documents(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        if not value:
+            raise ValueError("Select at least one document.")
+        if len(value) > RAG_MAX_SELECTED_DOCUMENTS:
+            raise ValueError(
+                f"Select at most {RAG_MAX_SELECTED_DOCUMENTS} documents."
+            )
+
+        normalized = []
+        seen = set()
+        for filename in value:
+            clean_name = filename.strip()
+            if (
+                not clean_name
+                or Path(clean_name).name != clean_name
+                or sanitize_filename(clean_name) != clean_name
+                or not clean_name.lower().endswith(".pdf")
+            ):
+                raise ValueError("Document names must be valid PDF filenames.")
+            if clean_name not in seen:
+                normalized.append(clean_name)
+                seen.add(clean_name)
         return normalized
 
 
@@ -179,8 +253,6 @@ class IndexResponse(BaseModel):
     pdf_count: int
     pages_loaded: int
     chunks_created: int
-    data_dir: str
-    vector_store: str
 
 
 class IndexJobResponse(BaseModel):
@@ -215,10 +287,22 @@ class RelevanceFilteringRetriever:
         self.min_score = min_score
         self.index_revision = index_revision
 
-    def retrieve(self, question: str) -> RetrievalResult:
+    def retrieve(
+        self,
+        question: str,
+        document_names: list[str] | None = None,
+    ) -> RetrievalResult:
+        search_kwargs: dict[str, Any] = {"k": self.top_k}
+        if document_names:
+            if len(document_names) == 1:
+                search_kwargs["filter"] = {"source_name": document_names[0]}
+            else:
+                search_kwargs["filter"] = {
+                    "source_name": {"$in": document_names}
+                }
         candidates = self.vectorstore.similarity_search_with_relevance_scores(
             question,
-            k=self.top_k,
+            **search_kwargs,
         )
         valid_scores = [
             score
@@ -375,7 +459,7 @@ prompt = ChatPromptTemplate.from_messages(
 )
 
 
-def _build_rag_components() -> tuple[Any | None, Any | None]:
+def _build_rag_components() -> tuple[Any | None, GenerationProvider | None]:
     if not GOOGLE_API_KEY:
         logger.warning("GOOGLE_API_KEY is not configured; /ask will return 503.")
         return None, None
@@ -406,10 +490,27 @@ def _build_rag_components() -> tuple[Any | None, Any | None]:
         timeout=GEMINI_REQUEST_TIMEOUT_SECONDS,
         max_retries=GEMINI_MAX_RETRIES,
     )
-    return retriever, llm
+    generation_provider = GeminiGenerationProvider(
+        model=GEMINI_CHAT_MODEL,
+        prompt=prompt,
+        client=llm,
+    )
+    return retriever, generation_provider
 
 
-retriever, llm = _build_rag_components()
+def _build_fallback_provider() -> GenerationProvider | None:
+    if not RAG_OLLAMA_FALLBACK_ENABLED:
+        return None
+    return OllamaGenerationProvider(
+        model=OLLAMA_CHAT_MODEL,
+        base_url=OLLAMA_BASE_URL,
+        system_prompt=system_prompt,
+        timeout_seconds=OLLAMA_REQUEST_TIMEOUT_SECONDS,
+    )
+
+
+retriever, generation_provider = _build_rag_components()
+fallback_provider = _build_fallback_provider()
 
 
 def _require_google_api_key() -> str:
@@ -427,14 +528,13 @@ def _index_response(stats: IndexStats, status: str = "indexed") -> IndexResponse
         pdf_count=stats.pdf_count,
         pages_loaded=stats.pages_loaded,
         chunks_created=stats.chunks_created,
-        data_dir=stats.data_dir,
-        vector_store=stats.vector_store,
     )
 
 
 def _reload_rag_components() -> None:
-    global retriever, llm
-    retriever, llm = _build_rag_components()
+    global retriever, generation_provider, fallback_provider
+    retriever, generation_provider = _build_rag_components()
+    fallback_provider = _build_fallback_provider()
     answer_cache.clear()
 
 
@@ -600,12 +700,17 @@ def ensure_source_markers(answer: str, source_count: int) -> str:
     return f"{normalized}\n\nQuellen: {markers}"
 
 
-def _answer_cache_key(question: str) -> str:
+def _answer_cache_key(question: str, document_names: list[str] | None = None) -> str:
     index_revision = getattr(retriever, "index_revision", "unknown")
+    document_scope = (
+        "*" if document_names is None else "\n".join(sorted(document_names))
+    )
     components = (
         question,
+        document_scope,
         index_revision,
-        GEMINI_CHAT_MODEL,
+        getattr(generation_provider, "model", GEMINI_CHAT_MODEL),
+        getattr(fallback_provider, "model", "no-fallback"),
         GEMINI_EMBEDDING_MODEL,
         str(RAG_TOP_K),
         str(RAG_MIN_RELEVANCE_SCORE),
@@ -628,12 +733,37 @@ def _remove_uploaded_file(path: Path, request_id: str) -> None:
         )
 
 
+def _restore_deleted_file(path: Path, backup_path: Path, request_id: str) -> None:
+    try:
+        if backup_path.exists() and not path.exists():
+            backup_path.replace(path)
+    except OSError:
+        logger.exception(
+            "rag_delete_rollback_failed request_id=%s filename=%s",
+            request_id,
+            path.name,
+        )
+
+
+def _discard_deletion_backup(backup_path: Path, request_id: str) -> None:
+    try:
+        backup_path.unlink(missing_ok=True)
+    except OSError:
+        logger.warning(
+            "rag_delete_backup_cleanup_failed request_id=%s filename=%s",
+            request_id,
+            backup_path.name,
+        )
+
+
 def _run_index_job(
     job_id: str,
     *,
     operation: str,
     request_id: str,
     uploaded_path: Path | None = None,
+    deleted_path: Path | None = None,
+    deletion_backup_path: Path | None = None,
     upload_bytes: int | None = None,
     page_count: int | None = None,
 ) -> None:
@@ -642,7 +772,10 @@ def _run_index_job(
 
     try:
         stats = _rebuild_vector_store(request_id=request_id)
-        result_status = "uploaded_and_indexed" if uploaded_path else "reindexed"
+        result_status = {
+            "upload": "uploaded_and_indexed",
+            "delete": "deleted_and_indexed",
+        }.get(operation, "reindexed")
         result = _index_response(stats, status=result_status).model_dump()
         index_job_store.update(job_id, status="completed", result=result)
 
@@ -659,9 +792,23 @@ def _run_index_job(
                 stats.chunks_created,
                 _elapsed_ms(started_at),
             )
+        if deleted_path is not None and deletion_backup_path is not None:
+            _discard_deletion_backup(deletion_backup_path, request_id)
+            logger.info(
+                "rag_document_deleted request_id=%s job_id=%s filename=%s "
+                "pdf_count=%s chunks_created=%s elapsed_ms=%s",
+                request_id,
+                job_id,
+                deleted_path.name,
+                stats.pdf_count,
+                stats.chunks_created,
+                _elapsed_ms(started_at),
+            )
     except Exception as exc:
         if uploaded_path is not None:
             _remove_uploaded_file(uploaded_path, request_id)
+        if deleted_path is not None and deletion_backup_path is not None:
+            _restore_deleted_file(deleted_path, deletion_backup_path, request_id)
 
         if isinstance(exc, HTTPException) and isinstance(exc.detail, str):
             error = exc.detail
@@ -682,6 +829,8 @@ def _submit_index_job(
     operation: str,
     request_id: str,
     uploaded_path: Path | None = None,
+    deleted_path: Path | None = None,
+    deletion_backup_path: Path | None = None,
     upload_bytes: int | None = None,
     page_count: int | None = None,
 ) -> dict[str, Any]:
@@ -689,11 +838,15 @@ def _submit_index_job(
         job = index_job_store.create(
             operation=operation,
             request_id=request_id,
-            filename=uploaded_path.name if uploaded_path else None,
+            filename=(uploaded_path or deleted_path).name
+            if uploaded_path or deleted_path
+            else None,
         )
     except JobCapacityError as exc:
         if uploaded_path is not None:
             _remove_uploaded_file(uploaded_path, request_id)
+        if deleted_path is not None and deletion_backup_path is not None:
+            _restore_deleted_file(deleted_path, deletion_backup_path, request_id)
         raise HTTPException(
             status_code=503,
             detail="The index job queue is full. Try again later.",
@@ -707,12 +860,16 @@ def _submit_index_job(
             operation=operation,
             request_id=request_id,
             uploaded_path=uploaded_path,
+            deleted_path=deleted_path,
+            deletion_backup_path=deletion_backup_path,
             upload_bytes=upload_bytes,
             page_count=page_count,
         )
     except RuntimeError as exc:
         if uploaded_path is not None:
             _remove_uploaded_file(uploaded_path, request_id)
+        if deleted_path is not None and deletion_backup_path is not None:
+            _restore_deleted_file(deleted_path, deletion_backup_path, request_id)
         index_job_store.update(
             job["job_id"],
             status="failed",
@@ -726,18 +883,115 @@ def _submit_index_job(
     return index_job_store.get(job["job_id"]) or job
 
 
+def _validated_document_selection(document_names: list[str] | None) -> list[str] | None:
+    if document_names is None:
+        return None
+
+    available = {path.name for path in list_pdf_files(DATA_DIR)}
+    unknown = sorted(set(document_names) - available)
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown document: {unknown[0]}",
+        )
+    return document_names
+
+
+def _document_path(filename: str) -> Path:
+    if (
+        Path(filename).name != filename
+        or sanitize_filename(filename) != filename
+        or not filename.lower().endswith(".pdf")
+    ):
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    data_directory = Path(DATA_DIR).resolve()
+    document_path = (data_directory / filename).resolve()
+    if document_path.parent != data_directory or not document_path.is_file():
+        raise HTTPException(status_code=404, detail="Document not found.")
+    return document_path
+
+
+def _generate_answer(
+    *,
+    context: str,
+    question: str,
+    request: Request,
+) -> tuple[str, str]:
+    if generation_provider is None:
+        raise HTTPException(
+            status_code=503,
+            detail="RAG service is not configured. Set GOOGLE_API_KEY before using /ask.",
+        )
+
+    try:
+        provider_circuit.before_call()
+    except CircuitOpenError as exc:
+        if fallback_provider is None:
+            logger.warning(
+                "rag_provider_circuit_rejected request_id=%s retry_after=%s",
+                _request_id(request),
+                exc.retry_after,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="The model provider is temporarily unavailable.",
+                headers={"Retry-After": str(exc.retry_after)},
+            ) from exc
+
+        logger.info(
+            "rag_provider_fallback_used request_id=%s reason=circuit_open provider=%s",
+            _request_id(request),
+            fallback_provider.name,
+        )
+        return (
+            fallback_provider.generate(context=context, question=question),
+            fallback_provider.name,
+        )
+
+    try:
+        answer = generation_provider.generate(context=context, question=question)
+    except Exception as exc:
+        provider_status = _provider_status_code(exc)
+        if provider_status not in {429, 500, 502, 503, 504}:
+            raise
+
+        provider_circuit.record_failure()
+        if fallback_provider is None:
+            raise
+
+        logger.info(
+            "rag_provider_fallback_used request_id=%s reason=primary_unavailable "
+            "provider=%s primary_status=%s",
+            _request_id(request),
+            fallback_provider.name,
+            provider_status,
+        )
+        return (
+            fallback_provider.generate(context=context, question=question),
+            fallback_provider.name,
+        )
+
+    provider_circuit.record_success()
+    return answer, generation_provider.name
+
+
 @app.get("/health")
 async def health() -> dict[str, bool | str | int | float]:
     circuit = provider_circuit.snapshot()
     return {
         "status": "ok",
-        "rag_ready": retriever is not None and llm is not None,
+        "rag_ready": retriever is not None and generation_provider is not None,
+        "generation_provider": (
+            generation_provider.name
+            if generation_provider is not None
+            else "unconfigured"
+        ),
+        "ollama_fallback_enabled": fallback_provider is not None,
         "top_k": RAG_TOP_K,
         "min_relevance_score": RAG_MIN_RELEVANCE_SCORE,
         "answer_cache_enabled": answer_cache.enabled,
         "provider_circuit_state": circuit.state,
-        "data_dir": DATA_DIR,
-        "vector_store": CHROMA_DB_DIR,
         "pdf_count": len(list_pdf_files(DATA_DIR)),
     }
 
@@ -827,6 +1081,46 @@ async def upload_document(
     return IndexJobResponse.model_validate(job)
 
 
+@app.delete(
+    "/documents/{filename}",
+    response_model=IndexJobResponse,
+    status_code=202,
+    dependencies=[Depends(_require_api_token), Depends(_enforce_rate_limit)],
+)
+async def delete_document(
+    filename: str,
+    request: Request,
+    response: Response,
+) -> IndexJobResponse:
+    _require_google_api_key()
+    document_path = _document_path(filename)
+    if len(list_pdf_files(DATA_DIR)) <= 1:
+        raise HTTPException(
+            status_code=409,
+            detail="The last document cannot be deleted from the knowledge base.",
+        )
+
+    backup_path = document_path.with_name(
+        f".{document_path.name}.{uuid.uuid4().hex}.deleting"
+    )
+    try:
+        document_path.replace(backup_path)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to stage the document for deletion.",
+        ) from exc
+
+    job = _submit_index_job(
+        operation="delete",
+        request_id=_request_id(request),
+        deleted_path=document_path,
+        deletion_backup_path=backup_path,
+    )
+    response.headers["Location"] = f"/jobs/{job['job_id']}"
+    return IndexJobResponse.model_validate(job)
+
+
 @app.post(
     "/ask",
     response_model=QueryResponse,
@@ -834,13 +1128,14 @@ async def upload_document(
 )
 def ask_question(query: QueryRequest, request: Request) -> QueryResponse:
     request_start = time.perf_counter()
-    if retriever is None or llm is None:
+    if retriever is None or generation_provider is None:
         raise HTTPException(
             status_code=503,
             detail="RAG service is not configured. Set GOOGLE_API_KEY before using /ask.",
         )
 
-    cache_key = _answer_cache_key(query.question)
+    selected_documents = _validated_document_selection(query.documents)
+    cache_key = _answer_cache_key(query.question, selected_documents)
     cached_response = answer_cache.get(cache_key)
     if cached_response is not None:
         logger.info(
@@ -855,10 +1150,9 @@ def ask_question(query: QueryRequest, request: Request) -> QueryResponse:
         _request_id(request),
         len(query.question),
     )
-    generation_started = False
     try:
         retrieval_start = time.perf_counter()
-        retrieval = retriever.retrieve(query.question)
+        retrieval = retriever.retrieve(query.question, selected_documents)
         docs = retrieval.documents
         retrieval_ms = _elapsed_ms(retrieval_start)
 
@@ -880,30 +1174,14 @@ def ask_question(query: QueryRequest, request: Request) -> QueryResponse:
             _cache_response(cache_key, response)
             return response
 
-        try:
-            provider_circuit.before_call()
-        except CircuitOpenError as exc:
-            logger.warning(
-                "rag_provider_circuit_rejected request_id=%s retry_after=%s",
-                _request_id(request),
-                exc.retry_after,
-            )
-            raise HTTPException(
-                status_code=503,
-                detail="The model provider is temporarily unavailable.",
-                headers={"Retry-After": str(exc.retry_after)},
-            ) from exc
-
-        generation_started = True
         llm_start = time.perf_counter()
-        chain = prompt | llm | StrOutputParser()
+        generated_answer, provider_name = _generate_answer(
+            context=format_docs(docs),
+            question=query.question,
+            request=request,
+        )
         answer = ensure_source_markers(
-            chain.invoke(
-                {
-                    "context": format_docs(docs),
-                    "question": query.question,
-                }
-            ),
+            generated_answer,
             len(docs),
         )
         llm_ms = _elapsed_ms(llm_start)
@@ -911,7 +1189,7 @@ def ask_question(query: QueryRequest, request: Request) -> QueryResponse:
         logger.info(
             "rag_question_answered status=success request_id=%s question_chars=%s "
             "candidates=%s sources=%s min_score=%s best_score=%s "
-            "retrieval_ms=%s llm_ms=%s total_ms=%s",
+            "retrieval_ms=%s llm_ms=%s total_ms=%s provider=%s",
             _request_id(request),
             len(query.question),
             retrieval.candidate_count,
@@ -921,9 +1199,9 @@ def ask_question(query: QueryRequest, request: Request) -> QueryResponse:
             retrieval_ms,
             llm_ms,
             total_ms,
+            provider_name,
         )
         response = QueryResponse(answer=answer, sources=build_sources(docs))
-        provider_circuit.record_success()
         _cache_response(cache_key, response)
         return response
     except Exception as exc:
@@ -932,8 +1210,6 @@ def ask_question(query: QueryRequest, request: Request) -> QueryResponse:
 
         provider_status = _provider_status_code(exc)
         if provider_status in {429, 500, 502, 503, 504}:
-            if generation_started:
-                provider_circuit.record_failure()
             circuit = provider_circuit.snapshot()
             retry_after = circuit.retry_after or 5
             logger.warning(

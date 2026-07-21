@@ -94,5 +94,24 @@ def test_direct_pdf_loader_preserves_source_and_page_metadata():
     documents = rag_index.load_pdf_documents([pdf_path])
 
     assert documents
-    assert documents[0].metadata == {"source": str(pdf_path), "page": 0}
+    assert documents[0].metadata == {
+        "source": str(pdf_path),
+        "source_name": "sample_document.pdf",
+        "page": 0,
+    }
     assert "Retrieval-Augmented Generation" in documents[0].page_content
+
+
+def test_list_pdf_files_is_case_insensitive_and_excludes_symlinks(
+    tmp_path,
+):
+    lowercase = tmp_path / "a.pdf"
+    uppercase = tmp_path / "b.PDF"
+    lowercase.write_bytes(b"pdf")
+    uppercase.write_bytes(b"pdf")
+    (tmp_path / "notes.txt").write_text("text")
+    (tmp_path / "linked.pdf").symlink_to(lowercase)
+
+    files = rag_index.list_pdf_files(str(tmp_path))
+
+    assert files == [lowercase, uppercase]
