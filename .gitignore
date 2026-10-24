@@ -6,6 +6,7 @@ chroma_db/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.streamlit/secrets.toml
 *.pyc
 .DS_Store
 data/*

@@ -1,11 +1,15 @@
 import os
 import time
 from io import BytesIO
+from types import SimpleNamespace
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
+from google.genai.errors import ClientError
 from index_jobs import IndexJobStore
 from langchain_core.documents import Document
+from langchain_google_genai.chat_models import ChatGoogleGenerativeAIError
 from pypdf import PdfWriter
 from rag_index import (
     IndexStats,
@@ -61,6 +65,105 @@ def test_health_is_available_without_api_key():
     assert payload["answer_cache_enabled"] is True
     assert payload["provider_circuit_state"] == "closed"
     assert "pdf_count" in payload
+    assert payload["max_upload_bytes"] == main.RAG_MAX_UPLOAD_BYTES
+    assert payload["max_pdf_pages"] == main.RAG_MAX_PDF_PAGES
+
+
+def test_health_timeout_budget_includes_primary_retries_and_fallback(monkeypatch):
+    monkeypatch.setattr(main, "GEMINI_REQUEST_TIMEOUT_SECONDS", 60)
+    monkeypatch.setattr(main, "GEMINI_MAX_RETRIES", 2)
+    monkeypatch.setattr(main, "OLLAMA_REQUEST_TIMEOUT_SECONDS", 90)
+    monkeypatch.setattr(main, "fallback_provider", object())
+
+    assert client.get("/health").json()["answer_timeout_seconds"] == 330
+
+
+def test_wrapped_google_quota_error_triggers_fallback(monkeypatch):
+    class QuotaLimitedPrimary:
+        def generate(self, **kwargs):
+            try:
+                raise ClientError(
+                    429, {"error": {"code": 429, "message": "quota exceeded"}}
+                )
+            except ClientError as error:
+                raise ChatGoogleGenerativeAIError("wrapped provider error") from error
+
+    monkeypatch.setattr(main, "generation_provider", QuotaLimitedPrimary())
+    monkeypatch.setattr(
+        main,
+        "fallback_provider",
+        SimpleNamespace(name="ollama", generate=lambda **kwargs: "Local answer"),
+    )
+    request = SimpleNamespace(state=SimpleNamespace(request_id="quota-test"))
+    assert main._generate_answer(
+        context="Text", question="Question", request=request
+    ) == ("Local answer", "ollama")
+    assert main.provider_circuit.snapshot().consecutive_failures == 1
+
+
+def test_provider_status_handles_wrapped_timeouts_and_cause_cycles():
+    wrapped = RuntimeError("wrapper")
+    wrapped.__cause__ = httpx.ReadTimeout("timeout")
+    assert main._provider_status_code(wrapped) == 504
+
+    wrapped.__cause__ = wrapped
+    assert main._provider_status_code(wrapped) is None
+
+
+@pytest.mark.parametrize(
+    "error",
+    [TimeoutError(), httpx.ReadTimeout("timeout"), httpx.ConnectError("offline")],
+)
+def test_transport_failure_reopens_half_open_circuit_and_uses_fallback(
+    monkeypatch, error
+):
+    clock = [0]
+    circuit = main.CircuitBreaker(
+        failure_threshold=1, recovery_seconds=10, clock=lambda: clock[0]
+    )
+    circuit.record_failure()
+    clock[0] = 10
+
+    class FailingPrimary:
+        def generate(self, **kwargs):
+            raise error
+
+    fallback = SimpleNamespace(name="ollama", generate=lambda **kwargs: "Local answer")
+    monkeypatch.setattr(main, "provider_circuit", circuit)
+    monkeypatch.setattr(main, "generation_provider", FailingPrimary())
+    monkeypatch.setattr(main, "fallback_provider", fallback)
+    request = SimpleNamespace(state=SimpleNamespace(request_id="recovery-test"))
+
+    assert main._generate_answer(
+        context="Text", question="Question", request=request
+    ) == ("Local answer", "ollama")
+    assert circuit.snapshot().state == "open"
+    clock[0] = 20
+    circuit.before_call()
+    circuit.record_success()
+    assert circuit.snapshot().state == "closed"
+
+
+def test_unexpected_generation_error_does_not_block_future_probes(monkeypatch):
+    clock = [0]
+    circuit = main.CircuitBreaker(
+        failure_threshold=1, recovery_seconds=10, clock=lambda: clock[0]
+    )
+    circuit.record_failure()
+    clock[0] = 10
+
+    class FailingPrimary:
+        def generate(self, **kwargs):
+            raise ValueError("invalid response")
+
+    monkeypatch.setattr(main, "provider_circuit", circuit)
+    monkeypatch.setattr(main, "generation_provider", FailingPrimary())
+    request = SimpleNamespace(state=SimpleNamespace(request_id="recovery-test"))
+    with pytest.raises(ValueError):
+        main._generate_answer(context="Text", question="Question", request=request)
+    circuit.before_call()
+    circuit.record_success()
+    assert circuit.snapshot().state == "closed"
 
 
 def test_health_returns_generated_request_id():
@@ -680,6 +783,165 @@ def test_delete_document_requires_token_when_configured(tmp_path, monkeypatch):
 
     assert response.status_code == 401
     assert (tmp_path / "remove.pdf").exists()
+
+
+class DeferredExecutor:
+    def __init__(self):
+        self.calls = []
+
+    def submit(self, function, *args, **kwargs):
+        self.calls.append((function, args, kwargs))
+
+    def run_next(self):
+        function, args, kwargs = self.calls.pop(0)
+        function(*args, **kwargs)
+
+
+def index_stats(directory):
+    count = len(main.list_pdf_files(str(directory)))
+    return IndexStats(
+        pdf_count=count,
+        pages_loaded=count,
+        chunks_created=count,
+        data_dir=str(directory),
+        vector_store="chroma",
+        collection_name="test-index",
+    )
+
+
+def test_queued_deletions_do_not_change_an_earlier_jobs_corpus(tmp_path, monkeypatch):
+    for filename in ("first.pdf", "second.pdf", "keep.pdf"):
+        (tmp_path / filename).write_bytes(make_pdf_bytes())
+    executor = DeferredExecutor()
+    indexed_documents = []
+
+    def rebuild(**kwargs):
+        if indexed_documents:
+            raise main.HTTPException(status_code=500, detail="index failed")
+        indexed_documents.extend(
+            path.name for path in main.list_pdf_files(str(tmp_path))
+        )
+        return index_stats(tmp_path)
+
+    monkeypatch.setattr(main, "GOOGLE_API_KEY", "configured-for-test")
+    monkeypatch.setattr(main, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "index_executor", executor)
+    monkeypatch.setattr(main, "_rebuild_vector_store", rebuild)
+    first = client.delete("/documents/first.pdf").json()
+    second = client.delete("/documents/second.pdf").json()
+
+    assert len(main.list_pdf_files(str(tmp_path))) == 3
+    executor.run_next()
+    assert main.index_job_store.get(first["job_id"])["status"] == "completed"
+    executor.run_next()
+    assert main.index_job_store.get(second["job_id"])["status"] == "failed"
+    assert indexed_documents == [
+        path.name for path in main.list_pdf_files(str(tmp_path))
+    ]
+    assert indexed_documents == ["keep.pdf", "second.pdf"]
+
+
+def test_queued_deletions_recheck_last_document_in_worker(tmp_path, monkeypatch):
+    for filename in ("first.pdf", "last.pdf"):
+        (tmp_path / filename).write_bytes(make_pdf_bytes())
+    executor = DeferredExecutor()
+    monkeypatch.setattr(main, "GOOGLE_API_KEY", "configured-for-test")
+    monkeypatch.setattr(main, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "index_executor", executor)
+    monkeypatch.setattr(
+        main, "_rebuild_vector_store", lambda **kwargs: index_stats(tmp_path)
+    )
+    first = client.delete("/documents/first.pdf")
+    last = client.delete("/documents/last.pdf")
+
+    assert first.status_code == last.status_code == 202
+    executor.run_next()
+    executor.run_next()
+    assert main.index_job_store.get(last.json()["job_id"])["status"] == "failed"
+    assert (tmp_path / "last.pdf").exists()
+
+
+def test_queued_uploads_are_isolated_and_keep_unique_filenames(tmp_path, monkeypatch):
+    executor = DeferredExecutor()
+    corpora = []
+
+    def rebuild(**kwargs):
+        corpora.append([path.name for path in main.list_pdf_files(str(tmp_path))])
+        return index_stats(tmp_path)
+
+    monkeypatch.setattr(main, "GOOGLE_API_KEY", "configured-for-test")
+    monkeypatch.setattr(main, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "index_executor", executor)
+    monkeypatch.setattr(main, "_rebuild_vector_store", rebuild)
+    first = client.post(
+        "/documents", files={"file": ("same.pdf", make_pdf_bytes(), "application/pdf")}
+    )
+    second = client.post(
+        "/documents", files={"file": ("same.pdf", make_pdf_bytes(), "application/pdf")}
+    )
+
+    assert first.status_code == second.status_code == 202
+    assert main.list_pdf_files(str(tmp_path)) == []
+    executor.run_next()
+    executor.run_next()
+    assert corpora == [["same.pdf"], ["same-1.pdf", "same.pdf"]]
+    assert main.index_job_store.get(second.json()["job_id"])["filename"] == "same-1.pdf"
+    assert list(tmp_path.glob(".upload-*")) == []
+
+
+def test_failed_queued_upload_preserves_prior_successful_index(tmp_path, monkeypatch):
+    executor = DeferredExecutor()
+    active_files = []
+
+    def rebuild(**kwargs):
+        if active_files:
+            raise main.HTTPException(status_code=500, detail="index failed")
+        active_files.extend(path.name for path in main.list_pdf_files(str(tmp_path)))
+        return index_stats(tmp_path)
+
+    monkeypatch.setattr(main, "GOOGLE_API_KEY", "configured-for-test")
+    monkeypatch.setattr(main, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "index_executor", executor)
+    monkeypatch.setattr(main, "_rebuild_vector_store", rebuild)
+    first = client.post(
+        "/documents", files={"file": ("first.pdf", make_pdf_bytes(), "application/pdf")}
+    )
+    second = client.post(
+        "/documents",
+        files={"file": ("second.pdf", make_pdf_bytes(), "application/pdf")},
+    )
+    executor.run_next()
+    executor.run_next()
+
+    assert main.index_job_store.get(first.json()["job_id"])["status"] == "completed"
+    assert main.index_job_store.get(second.json()["job_id"])["status"] == "failed"
+    assert active_files == [path.name for path in main.list_pdf_files(str(tmp_path))]
+    assert active_files == ["first.pdf"]
+    assert list(tmp_path.glob(".upload-*")) == []
+
+
+def test_full_job_queue_leaves_pending_deletion_untouched(tmp_path, monkeypatch):
+    for filename in ("first.pdf", "keep.pdf"):
+        (tmp_path / filename).write_bytes(make_pdf_bytes())
+    store = IndexJobStore(max_jobs=1)
+    store.create(operation="reindex", request_id="existing-request")
+    monkeypatch.setattr(main, "index_job_store", store)
+    monkeypatch.setattr(main, "GOOGLE_API_KEY", "configured-for-test")
+    monkeypatch.setattr(main, "DATA_DIR", str(tmp_path))
+
+    assert client.delete("/documents/first.pdf").status_code == 503
+    assert (tmp_path / "first.pdf").exists()
+    assert list(tmp_path.glob(".*.deleting")) == []
+
+
+def test_deletion_rejects_symlinks_to_other_documents(tmp_path, monkeypatch):
+    (tmp_path / "keep.pdf").write_bytes(make_pdf_bytes())
+    (tmp_path / "alias.pdf").symlink_to(tmp_path / "keep.pdf")
+    monkeypatch.setattr(main, "GOOGLE_API_KEY", "configured-for-test")
+    monkeypatch.setattr(main, "DATA_DIR", str(tmp_path))
+
+    assert client.delete("/documents/alias.pdf").status_code == 404
+    assert (tmp_path / "keep.pdf").exists()
 
 
 def test_rebuild_rejects_concurrent_indexing(monkeypatch):

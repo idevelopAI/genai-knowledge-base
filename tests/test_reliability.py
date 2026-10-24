@@ -83,3 +83,17 @@ def test_failed_half_open_probe_reopens_circuit():
 
     assert circuit.snapshot().state == "open"
     assert circuit.snapshot().retry_after == 20
+
+
+def test_non_transient_probe_error_allows_another_recovery_attempt():
+    clock = Clock()
+    circuit = CircuitBreaker(failure_threshold=1, recovery_seconds=20, clock=clock)
+    circuit.record_failure()
+    clock.advance(20)
+    circuit.before_call()
+
+    circuit.release_probe()
+    circuit.before_call()
+    circuit.record_success()
+
+    assert circuit.snapshot().state == "closed"

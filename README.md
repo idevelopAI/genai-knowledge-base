@@ -1,539 +1,306 @@
-# End-to-End GenAI Knowledge Base (RAG)
+# GenAI Knowledge Base
 
 [![CI](https://github.com/idevelopAI/genai-knowledge-base/actions/workflows/ci.yml/badge.svg)](https://github.com/idevelopAI/genai-knowledge-base/actions/workflows/ci.yml)
 
-A containerized Retrieval-Augmented Generation system for asking questions over
-internal PDF documents. The project combines a FastAPI backend, direct `pypdf`
-document loading, LangChain integrations, ChromaDB, Google Gemini models, and a
-Streamlit chat UI.
+Ask questions about PDF documents and inspect the passages behind each answer.
+A local RAG application built with **FastAPI, Streamlit, ChromaDB, and Google
+Gemini**, with optional Ollama fallback for answer generation.
 
-The system covers document ingestion, vector search, grounded answer
-generation, API access, Docker-based packaging, CI checks, and an Azure
-Terraform infrastructure draft.
+![Document chat with an answer and expandable sources](docs/screenshots/chat-with-sources.png)
 
-The Streamlit UI and sample questions use German because the included sample
-documents and demo workflow are German-focused.
+The interface is German; the documentation is English. The screenshot uses the
+included sample PDF and a fixed response to illustrate the interface.
 
-## Why This Project Matters
+## Quick Start
 
-Companies often have useful information locked inside PDFs, manuals, policies,
-and internal guides. This project turns those documents into a searchable
-knowledge base where users can ask natural language questions and receive
-context-grounded answers with source references.
+Requires Docker with Compose and a Google API key with access to the configured
+chat and embedding models.
+
+1. Create your local configuration without overwriting an existing file:
+
+   ```bash
+   cp -n example.env .env
+   ```
+
+2. Set `GOOGLE_API_KEY` in your local `.env`. Optionally set `RAG_API_TOKEN` to
+   protect the API. Never commit either secret.
+3. Start both services:
+
+   ```bash
+   docker compose up --build
+   ```
+
+4. Open [the chat](http://127.0.0.1:8501). On the first run, open **Verwalten**
+   in the sidebar and click **Index neu erstellen**. Wait for indexing to finish.
+
+Two sample PDFs are included. Uploading another PDF also rebuilds the index.
+Existing documents and embeddings persist in `data/` and `chroma_db/`.
+Stop the services with `docker compose down`; this does not delete those folders.
+
+Compose publishes both services on `127.0.0.1` only. The frontend receives the
+API token and backend URLs, not the Google API key.
+
+## Using the App
+
+- **Document scope:** choose the PDFs to search in **Suchbereich**. Clearing the
+  selection disables questions; it never silently switches to all documents.
+- **Upload:** open **Hochladen**, choose a PDF, and click **Hochladen & indexieren**.
+  Indexing runs in the background, with status shown in the sidebar.
+- **Answers:** expand **Quellen** to inspect filenames, page numbers, and excerpts.
+  The header includes controls to start a new chat or download it as Markdown.
+- **Delete:** open **Verwalten**, select a PDF, and confirm **Dokument löschen**.
+  Deletion rebuilds the remaining index; the last document cannot be deleted.
+
+File changes run inside one indexing worker. Queued uploads stay outside the
+active PDF set, and a queued deletion does not remove its PDF early. Failed
+rebuilds retain the previous index and roll back the current job's file change.
+Successful indexing clears the answer cache and the current browser session's
+chat. Other open sessions may still display their earlier answers.
+
+<details>
+<summary>Upload interface</summary>
+
+![PDF upload controls](docs/screenshots/upload-reindex-sidebar.png)
+
+</details>
+
+### Demo Script
+
+1. Index the included PDFs and select only `sample_document.pdf`.
+2. Ask: `Wie funktioniert Retrieval-Augmented Generation?`
+3. Expand the sources and compare the excerpt with the PDF.
+4. Repeat the question to exercise the answer cache.
+5. Upload a non-sensitive PDF, wait for completion, select it, and ask a specific
+   question about its content.
+6. Delete that PDF and verify the remaining documents are still available.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    PDFs["PDF documents"] --> Loader["pypdf page loader"]
-    Loader --> Splitter["Recursive text splitter"]
-    Splitter --> Embeddings["Gemini embeddings"]
-    Embeddings --> Chroma["ChromaDB vector store"]
-
-    User["User in Streamlit UI"] --> API["FastAPI backend"]
-    User --> Selection["Document selection"]
-    Selection --> API
-    API --> Retriever["Retriever top-k chunks"]
-    Retriever --> Chroma
-    Retriever --> Metadata["Chroma source_name filter"]
-    Retriever --> Filter["Minimum relevance score"]
-    Filter --> Prompt["Grounded prompt with context"]
-    Prompt --> LLM["Gemini chat model"]
-    LLM -. transient failure .-> Ollama["Optional local Ollama fallback"]
-    LLM --> Answer["Answer with source citations"]
+    UI["Streamlit chat"] --> API["FastAPI: auth, rate limits, request IDs"]
+    API --> Cache["Answer cache"]
+    Cache -- miss --> Search["Gemini query embedding + document filter"]
+    Search --> Chroma["Local ChromaDB"]
+    Chroma --> Relevance["Top-k + relevance threshold"]
+    Relevance -- no usable context --> Refusal["Deterministic refusal"]
+    Relevance -- relevant passages --> Gemini["Gemini + circuit breaker"]
+    Gemini -. transient failure .-> Ollama["Optional Ollama fallback"]
+    Gemini --> Answer["Answer + source excerpts"]
     Ollama --> Answer
-    Answer --> User
+    Answer --> Cache
+    Cache -- hit --> UI
+    Answer --> UI
+    Refusal --> UI
 
-    Upload["PDF upload / reindex"] --> API
-    Delete["PDF deletion"] --> API
-    API --> Jobs["Bounded index job queue"]
-    Jobs --> Worker["Background index worker"]
-    Worker --> Loader
+    API -- upload / delete / reindex --> Queue["Bounded job queue"]
+    Queue --> Worker["Single indexing worker"]
+    Worker --> PDFs["PDFs: pypdf + chunking"]
+    PDFs --> Embeddings["Gemini embeddings"]
+    Embeddings --> Version["New collection + activation"]
+    Version --> Chroma
 ```
 
-## Screenshots
+Retrieval uses cosine similarity and `source_name` metadata filters. Chunks below
+the relevance cutoff are excluded before generation. The model is instructed to
+use only retrieved context and include `[Source N]` references; source markers
+are checked against the retrieved source list.
 
-Chat answers include expandable source citations:
+## Configuration
 
-![Streamlit chat answer with source citations](docs/screenshots/chat-with-sources.png)
+See [`example.env`](example.env) for all supported settings. Restart the services
+after changing configuration. Model availability and quotas depend on your
+Google account; change model IDs if a configured model is unavailable.
 
-The sidebar supports document discovery, PDF upload, and manual reindexing:
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `GOOGLE_API_KEY` | Required | Gemini embeddings and generation |
+| `RAG_API_TOKEN` | Unset | Optional bearer-token authentication |
+| `RAG_TOP_K` / `RAG_MIN_RELEVANCE_SCORE` | `3` / `0.65` | Candidate count and relevance cutoff |
+| `RAG_CHUNK_SIZE` / `RAG_CHUNK_OVERLAP` | `1000` / `200` | Text splitting |
+| `RAG_MAX_UPLOAD_BYTES` / `RAG_MAX_PDF_PAGES` | `10485760` / `200` | 10 MiB and 200-page PDF limits |
+| `RAG_MAX_INDEX_JOBS` | `100` | Bounded local job store |
+| `RAG_CACHE_TTL_SECONDS` / `RAG_CACHE_MAX_ENTRIES` | `300` / `256` | Answer cache; either `0` disables it |
+| `RAG_RATE_LIMIT_REQUESTS` / `RAG_RATE_LIMIT_WINDOW_SECONDS` | `60` / `60` | Requests per window; requests `0` disables it |
+| `RAG_CIRCUIT_FAILURE_THRESHOLD` / `RAG_CIRCUIT_RECOVERY_SECONDS` | `3` / `60` | Provider failures before cooldown |
+| `GEMINI_REQUEST_TIMEOUT_SECONDS` / `GEMINI_MAX_RETRIES` | `45` / `1` | Primary generation request settings |
+| `RAG_REQUEST_TIMEOUT_SECONDS` | Automatic | Frontend read-timeout override |
 
-![Streamlit sidebar upload and reindex controls](docs/screenshots/upload-reindex-sidebar.png)
+The frontend takes its read timeout from the backend: at least 180 seconds,
+allowing for configured primary attempts, optional fallback, and a 60-second
+retrieval/network margin. This is a client wait budget, not an end-to-end server
+deadline. Increase the override for slower local models or retrieval.
 
-## Tech Stack
+Reindex after changing the embedding model or chunk settings, or when upgrading
+an index that predates the `source_name` metadata field.
 
-- Backend: Python, FastAPI, Pydantic
-- RAG: pypdf, LangChain integrations, ChromaDB, Google Gemini, optional Ollama
-- Frontend: Streamlit
-- DevOps: Docker, GitHub Actions
-- Infrastructure: Terraform for an Azure deployment draft
+### Optional Ollama Fallback
 
-## Tradeoffs
-
-- ChromaDB keeps the local setup simple: it runs locally, persists embeddings on
-  disk, and avoids external database setup while still showing real vector
-  retrieval behavior.
-- Google Gemini is used for both embeddings and answer generation to keep the
-  model stack consistent and easy to configure through environment variables.
-- In production, the vector store should move to managed infrastructure with
-  backups, access controls, monitoring, and a clear migration path for schema or
-  embedding-model changes.
-- Local vector storage is convenient for demos, but it does not solve multi-user
-  concurrency, centralized persistence, auditability, or horizontal scaling.
-- The built-in rate limiter is process-local. For production with multiple app
-  instances, use shared infrastructure such as Redis, API Management, or an
-  ingress-level rate limiter.
-- Index jobs run in a bounded, process-local worker queue. This keeps local
-  requests responsive, but production deployments need a durable shared queue.
-- The response cache and provider circuit breaker are also process-local. A
-  multi-instance deployment needs shared cache and circuit state.
-- Relevance scores are retrieval heuristics, not calibrated confidence
-  probabilities. The cutoff should be tuned against representative evaluation
-  questions whenever the documents or embedding model change.
-
-## Features
-
-- Ingests PDFs from the local `data/` folder.
-- Supports PDF upload and reindexing from the Streamlit UI.
-- Supports selecting one or more PDFs to constrain retrieval through Chroma
-  metadata filters.
-- Deletes PDFs through an authenticated background job and restores the file if
-  reindexing fails.
-- Validates PDF structure and enforces configurable file-size and page limits.
-- Stores document chunks in a local ChromaDB vector database.
-- Rebuilds indexes through versioned collections so a failed build does not
-  replace the active index.
-- Runs upload and reindex operations asynchronously with job-status polling.
-- Exposes a FastAPI `/ask` endpoint for RAG answers.
-- Returns source document names, page numbers, and excerpts with each answer.
-- Prompts grounded answers to include inline `[Source N]` evidence markers and
-  normalizes missing or invalid markers against the retrieved source list.
-- Refuses without calling the LLM when retrieval returns no usable context.
-- Filters retrieved chunks by a configurable minimum relevance score and
-  refuses when none pass.
-- Treats retrieved document text as untrusted data in the system prompt.
-- Provides a Streamlit chat interface for interactive use.
-- Includes deterministic retrieval smoke checks and live RAG evaluation cases.
-- Includes Docker packaging and a GitHub Actions CI workflow.
-- Supports optional bearer-token API protection with `RAG_API_TOKEN`.
-- Includes configurable in-memory rate limiting for expensive API routes.
-- Adds `X-Request-ID` headers for request tracing across API responses and
-  logs.
-- Logs request timing, retrieval timing, LLM timing, and indexing metrics.
-- Runs blocking embedding and chat calls in FastAPI's worker threadpool and
-  bounds Gemini request duration and retries.
-- Caches repeated answers by question, active index revision, model, and
-  retrieval settings to avoid unnecessary provider calls.
-- Opens a temporary provider circuit after repeated transient failures and
-  allows one half-open recovery probe after the cooldown.
-- Uses a small generation-provider interface with Gemini as the primary provider
-  and an optional local Ollama fallback for transient generation failures.
-- Keeps secrets out of tracked code and Docker build context.
-
-## Current Scope
-
-This repository provides a complete local RAG workflow. It is not yet intended
-for production workloads that require distributed storage, horizontal scaling,
-or managed cloud operations.
-
-Current hardening work includes:
-
-- API health check.
-- Safe API error responses.
-- Configurable model, vector store, and retrieval settings.
-- Basic test coverage and CI validation.
-- Source-cited RAG responses.
-- PDF upload and reindex workflow.
-- JSONL-driven deterministic retrieval and live RAG eval checks.
-- Optional API token protection.
-- Configurable in-memory rate limiting.
-- Structured observability logs for RAG and indexing paths.
-- Request IDs for correlating client errors, server logs, and API responses.
-- Transactional index activation and upload rollback on indexing failure.
-- Bounded, parser-validated PDF uploads and concurrent rebuild protection.
-- Bounded background indexing jobs with queued, running, completed, and failed
-  states.
-- TTL/LRU answer caching and quota-aware provider circuit breaking.
-- Document-scoped retrieval, transactional document deletion, and optional
-  local answer-generation fallback.
-
-Planned improvements:
-
-- Complete Azure container deployment settings.
-- Replace in-memory rate limiting with shared infrastructure for multi-instance
-  deployments.
-- Replace process-local index jobs with a durable shared queue for
-  multi-instance deployments.
-
-## Local Setup
-
-Create a virtual environment and install dependencies:
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.lock.txt
-```
-
-`requirements.txt` lists the direct project dependencies. `requirements.lock.txt`
-pins the full resolved dependency set used by CI and Docker for reproducibility.
-
-To refresh the lock file after dependency changes:
-
-```bash
-pip install -r requirements.txt
-pip freeze > requirements.lock.txt
-```
-
-Create a local `.env` file from the safe example file, then add your real API
-key only in your local `.env` file:
-
-```bash
-cp example.env .env
-```
-
-Run ingestion to build the local vector database:
-
-```bash
-python ingest.py
-```
-
-Load the local environment variables and start the backend:
-
-```bash
-set -a
-source .env
-set +a
-uvicorn main:app --reload
-```
-
-Start the frontend in a second terminal:
-
-```bash
-streamlit run frontend.py
-```
-
-The Streamlit sidebar lets you select documents for a question, upload or delete
-a PDF, rebuild the index, and see the documents currently available to the
-backend. At least one PDF is retained so the active knowledge base never points
-to an empty index.
-
-PDF uploads default to a 10 MiB file limit and a 200-page limit. Override them
-with `RAG_MAX_UPLOAD_BYTES` and `RAG_MAX_PDF_PAGES`.
-`RAG_MAX_INDEX_JOBS` controls the number of retained or active local jobs and
-defaults to 100.
-`RAG_MIN_RELEVANCE_SCORE` controls the `0..1` scored-retrieval cutoff and
-defaults to `0.65`. Reindex once after upgrading so the active collection uses
-cosine distance consistently.
-`GEMINI_REQUEST_TIMEOUT_SECONDS` defaults to `45`, and `GEMINI_MAX_RETRIES`
-defaults to `1`, keeping upstream failures within the frontend request window.
-`RAG_CACHE_TTL_SECONDS=300` and `RAG_CACHE_MAX_ENTRIES=256` configure the
-process-local answer cache; set either to `0` to disable it.
-`RAG_CIRCUIT_FAILURE_THRESHOLD=3` and `RAG_CIRCUIT_RECOVERY_SECONDS=60`
-configure the provider circuit breaker.
-`RAG_MAX_SELECTED_DOCUMENTS=100` bounds the document filter accepted by `/ask`.
-After upgrading an existing checkout, run one reindex so every chunk receives
-the `source_name` metadata used by document selection.
-
-### Optional Ollama fallback
-
-Ollama can answer locally when Gemini generation returns a transient `429` or
-`5xx` error, or while the Gemini circuit is open. Gemini remains the primary
-provider, and Gemini embeddings are still required for retrieval and indexing.
-
-Install Ollama separately, pull a chat model, and enable the fallback in your
-local `.env`:
+With Ollama installed and running, download a model:
 
 ```bash
 ollama pull gemma3:4b
 ```
 
-```text
+Set these values in your local configuration and restart the backend:
+
+```dotenv
 RAG_OLLAMA_FALLBACK_ENABLED=true
 OLLAMA_CHAT_MODEL=gemma3:4b
-OLLAMA_BASE_URL=http://127.0.0.1:11434
+OLLAMA_BASE_URL=http://host.docker.internal:11434
 ```
 
-When the backend runs through Docker Compose, use
-`OLLAMA_BASE_URL=http://host.docker.internal:11434` instead. Prompts, document
-text, and model responses are not written to application logs.
+Use `http://127.0.0.1:11434` instead when the backend runs outside Docker.
+The container must be able to reach the host's Ollama service. Do not expose
+Ollama to an untrusted network just to enable fallback.
 
-## Demo Script
+Fallback handles transient Gemini generation failures, including timeouts,
+quota responses, selected server errors, and an open circuit.
+**This is not an offline mode:** indexing and query embeddings still use Google.
+An embedding quota failure can prevent retrieval before Ollama is reached.
 
-After starting the app, try this flow:
+## Local Development
 
-1. Open `http://localhost:8501`.
-2. Confirm the sidebar lists the PDFs from `data/`.
-3. Select one or more PDFs and ask this German sample question:
-   `Welche Informationen stehen im Dokument?`
-4. Expand the German `Quellen` section under the answer and check the source
-   filename/page.
-5. Upload another PDF from the sidebar, click the German
-   `Hochladen und indexieren` button, then ask a question about the new
-   document.
-6. Delete the uploaded PDF and confirm the background reindex completes.
-7. Run `python evals/run_retrieval_eval.py` for credential-free retrieval
-   checks.
-8. Run `python evals/run_eval.py` while the backend is running for live RAG
-   checks.
-
-## Docker
-
-Run both the backend and frontend with Docker Compose:
+Use Python 3.11, matching CI and Docker:
 
 ```bash
-docker compose up --build
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.lock.txt
 ```
 
-Compose passes the complete local environment only to the backend. The
-frontend receives the backend URLs and optional `RAG_API_TOKEN`, but not the
-Gemini API key.
-
-Then open:
-
-```text
-http://localhost:8501
-```
-
-Build only the backend image:
+Create and configure `.env` as described above. In the backend terminal:
 
 ```bash
-docker build -t rag-backend:latest .
+source .venv/bin/activate
+set -a
+source .env
+set +a
+uvicorn main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-Run the backend with local environment variables:
+In a second terminal, export the same local configuration so API authentication
+also works from the frontend:
 
 ```bash
-docker run --rm --env-file .env -p 8000:8000 rag-backend:latest
+source .venv/bin/activate
+set -a
+source .env
+set +a
+streamlit run frontend.py --server.address 127.0.0.1
 ```
 
-Then start the Streamlit frontend locally:
+Build the first index from the sidebar. Alternatively, `python ingest.py` builds
+it from the command line; do not run CLI ingestion concurrently with API jobs.
+
+## Tests and Evaluation
 
 ```bash
-streamlit run frontend.py
-```
-
-## Evaluation
-
-Run the deterministic PDF extraction, chunking, source, and context checks:
-
-```bash
+python -m pytest
 python evals/run_retrieval_eval.py
 ```
 
-This suite reads `evals/retrieval_cases.jsonl`, uses the production chunk sizes,
-and performs deterministic lexical ranking over the committed PDFs. It runs in
-CI without API credentials and acts as an ingestion/retrieval smoke test. It is
-not a replacement for vector or model-quality evaluation.
+CI runs both commands and builds the Docker image without model credentials.
+Tests cover the API, upload/deletion jobs, cache and circuit behavior, document
+filters, and Streamlit interactions.
 
-For the live end-to-end suite, start the application and run:
+The deterministic retrieval suite checks PDF extraction, chunking, lexical
+ranking, and expected source/context matches. It is a smoke test, **not** a
+measurement of embedding quality or generated-answer correctness.
+
+With the API running and configuration exported, the optional live checks are:
 
 ```bash
 python evals/run_eval.py
-```
-
-The live runner reads `evals/questions.jsonl`, sends each question to `/ask`,
-and checks answer terms, source names, source excerpts, refusal behavior, and
-inline `[Source N]` citations for grounded-answer cases. It uses
-`RAG_API_TOKEN` from the process environment when API authentication is enabled.
-
-Calibrate the scored-retrieval cutoff against the same labeled cases:
-
-```bash
 python evals/calibrate_relevance.py
 ```
 
-The calibration runner embeds each evaluation question, compares candidate
-thresholds, and reports false accepts, false refusals, and a recommended
-cutoff. It does not call the chat model. Treat the result as a dataset-specific
-baseline and rerun it after changing documents, chunking, or embedding models.
-For the committed two-document corpus and balanced ten-case dataset, the latest
-calibration selected `0.65` with no false accepts or false refusals.
+These consume Google quota. Calibration uses embeddings without chat generation;
+the live suite checks answers, citations, sources, and refusals against the
+cases in `evals/`. Run them manually after retrieval or model changes.
 
-## API
+### Dependencies
 
-If `RAG_API_TOKEN` is set, protected endpoints require:
+[`requirements.txt`](requirements.txt) lists direct dependencies;
+[`requirements.lock.txt`](requirements.lock.txt) pins the resolved versions used
+by CI and Docker. To update dependencies, install the direct requirements into
+a fresh Python 3.11 environment, run the tests, and regenerate the lock with
+`python -m pip freeze > requirements.lock.txt`. Review the diff before committing.
 
-```text
-Authorization: Bearer <RAG_API_TOKEN>
-```
+## API and Diagnostics
 
-The expensive endpoints are rate-limited by default using
-`RAG_RATE_LIMIT_REQUESTS=60` per `RAG_RATE_LIMIT_WINDOW_SECONDS=60`. Set
-`RAG_RATE_LIMIT_REQUESTS=0` to disable this locally.
+Interactive API documentation: [Swagger UI](http://127.0.0.1:8000/docs).
+When `RAG_API_TOKEN` is configured, protected endpoints require
+`Authorization: Bearer <token>`.
 
-`RAG_MIN_RELEVANCE_SCORE` filters the top `RAG_TOP_K` candidates before prompt
-construction. Higher values refuse more aggressively; calibrate the value with
-`python evals/run_eval.py` instead of treating it as model confidence.
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| `GET` | `/health` | Public readiness/configuration summary |
+| `POST` | `/ask` | Question with optional `documents` filename list |
+| `GET` | `/documents` | Available PDF filenames |
+| `POST` | `/documents` | Multipart PDF upload and indexing job |
+| `DELETE` | `/documents/{filename}` | Deletion and indexing job |
+| `POST` | `/reindex` | Rebuild the index |
+| `GET` | `/jobs/{job_id}` | Job status and result |
 
-Every API response includes an `X-Request-ID` header. Clients can send their own
-`X-Request-ID` value, or the API will generate one automatically. The same value
-is included in structured logs to make debugging easier.
+Upload, deletion, and reindex return `202 Accepted`. Poll the `Location` header
+until the job is `completed` or `failed`. `/ask` returns an `answer` and `sources`
+containing filenames, one-based page numbers, and excerpts.
 
-Health check:
+Every API response carries `X-Request-ID`. Use it to correlate UI errors with
+logs (`docker compose logs backend`). Events include retrieval/generation
+timing, source counts, cache hits/misses, indexing progress, provider fallback,
+and circuit state. Normal timing/cache events omit question and answer text;
+inspect exception logs before sharing them because third-party errors may
+contain additional details. Transient provider errors return `503` and
+`Retry-After`; the app's request limiter returns `429`.
 
-```bash
-curl http://127.0.0.1:8000/health
-```
+## Tradeoffs and Limitations
 
-Ask a German sample question:
+- **ChromaDB:** simple local persistence without a separate database service.
+  This setup is single-instance, not distributed storage or a backup solution.
+- **Gemini:** one provider for embeddings and generation, configurable models,
+  and a small integration surface. Availability, cost, and rate limits remain
+  external dependencies. Rebuilding embeds the full corpus and consumes quota.
+- **In-memory state:** jobs, cache, circuit state, and rate limits are local to
+  one backend process. Jobs are not durable across restarts; avoid stopping the
+  service during indexing and back up PDFs before bulk changes.
+- **Answer quality:** similarity scores are not confidence probabilities.
+  Citation presence does not prove a claim is supported. Prompt-injection
+  instructions reduce risk but do not guarantee resistance to hostile PDFs.
+  Chat history is displayed but not sent as conversation memory to `/ask`.
+- **PDF support:** text extraction only; scanned/image-only PDFs need OCR first.
+- **Production changes:** use durable jobs, shared cache/rate limits, managed
+  storage with backups, user-level access control, TLS, and deployment monitoring.
 
-```bash
-curl -X POST http://127.0.0.1:8000/ask \
-  -H "Content-Type: application/json" \
-  -d '{"question": "Welche Informationen stehen im Dokument?", "documents": ["sample_document.pdf"]}'
-```
+## Security and Data Handling
 
-List available documents:
+Keep this app local unless you add frontend authentication and a deployment
+security boundary. The optional API token is **not** a Streamlit login: anyone
+who can access the UI can use its configured backend credentials.
 
-```bash
-curl http://127.0.0.1:8000/documents
-```
+- `.env`, local vector data, Streamlit secrets, and additional PDFs under `data/`
+  are excluded from Git and Docker builds. Only the two sample PDFs are
+  allowlisted; do not replace their contents with private documents.
+- Gemini receives document text for embeddings and retrieved passages plus the
+  question for generation. Ollama fallback receives the retrieved context and
+  question at the configured endpoint. Upload only data you may share with those
+  providers.
+- Upload validation, size/page limits, filename checks, and authentication reduce
+  risk; they are not a sandbox for arbitrary untrusted documents.
+- Chat exports and screenshots can contain document text. Review them before
+  sharing. Rotate any credential that was exposed, even after removing it from
+  the repository.
 
-Upload and index a PDF:
-
-```bash
-curl -X POST http://127.0.0.1:8000/documents \
-  -F "file=@data/sample_document.pdf"
-```
-
-Delete a PDF and rebuild the remaining index:
-
-```bash
-curl -X DELETE http://127.0.0.1:8000/documents/sample_document.pdf
-```
-
-Rebuild the index from all PDFs in `data/`:
-
-```bash
-curl -X POST http://127.0.0.1:8000/reindex
-```
-
-Uploads and reindex requests return HTTP `202 Accepted` with a job resource:
-
-```json
-{
-  "job_id": "8f84484f-19d6-4d9e-a662-dc952f16ee40",
-  "operation": "upload",
-  "status": "queued",
-  "request_id": "5a56c4c2-851f-46db-bd72-a6d5fb30e6fb",
-  "filename": "sample_document.pdf",
-  "result": null,
-  "error": null,
-  "created_at": "2026-07-15T12:00:00+00:00",
-  "updated_at": "2026-07-15T12:00:00+00:00"
-}
-```
-
-Poll the URL from the `Location` response header until the job is completed or
-failed:
-
-```bash
-curl http://127.0.0.1:8000/jobs/8f84484f-19d6-4d9e-a662-dc952f16ee40
-```
-
-Example `/ask` response shape:
-
-```json
-{
-  "answer": "Antwort basierend auf dem gefundenen Kontext.",
-  "sources": [
-    {
-      "source": "sample_document.pdf",
-      "page": 1,
-      "excerpt": "Relevant retrieved text..."
-    }
-  ]
-}
-```
-
-## Security
-
-Report suspected vulnerabilities privately as described in
-[`SECURITY.md`](SECURITY.md). Do not include credentials or internal documents
-in public issues.
-
-- Real secrets must stay in local environment variables or `.env`.
-- `.env` and `.env.*` are ignored by Git and Docker.
-- `example.env` contains placeholder values only.
-- Local additions under `data/` are ignored by Git and excluded from Docker
-  builds; only the two explicit sample PDFs are allowlisted.
-- Set `RAG_API_TOKEN` to require bearer-token access for `/ask`, `/documents`,
-  `/reindex`, and `/jobs/{job_id}`.
-- `RAG_RATE_LIMIT_REQUESTS` and `RAG_RATE_LIMIT_WINDOW_SECONDS` limit repeated
-  calls to `/ask`, `/documents`, and `/reindex`.
-- `RAG_MAX_UPLOAD_BYTES` and `RAG_MAX_PDF_PAGES` bound uploaded PDF processing.
-- Uploaded files are parser-validated and removed if indexing fails. Deleted
-  files are restored if the replacement index cannot be built.
-- Index rebuilds activate a new version only after embedding succeeds; the
-  previous collection remains active on failure.
-- API errors avoid returning raw internal exception text to users.
-- Transient model-provider failures return HTTP `503` with `Retry-After`
-  instead of being reported as internal application failures.
-- Questions are trimmed, reject blank input, and are limited to 2,000
-  characters.
-- Document filters accept only exact filenames currently present in `data/` and
-  are bounded by `RAG_MAX_SELECTED_DOCUMENTS`.
-- Retrieved document instructions are explicitly treated as untrusted data;
-  empty retrieval results return a deterministic refusal without an LLM call.
-- Low-scoring retrieval results are excluded before prompt construction.
-- Bearer tokens are compared in constant time and represented only by a hashed
-  fingerprint in rate-limiter state and logs.
-
-If a real API key is ever committed, rotate the key immediately and remove it
-from Git history.
-
-## Observability
-
-The API logs structured events for the important paths:
-
-- `rag_question_answered`: question length, candidate/source counts, relevance
-  threshold and best score, retrieval time, LLM time, total request time, and
-  request ID.
-- `rag_index_rebuilt`: PDF count, loaded pages, generated chunks, and indexing
-  time, plus request ID when triggered through the API.
-- `rag_document_uploaded`: saved filename, upload size, page count, resulting
-  PDF count, chunk count, total upload/index time, and request ID.
-- `rag_document_deleted`: deleted filename, resulting PDF and chunk counts,
-  elapsed time, and request ID.
-- `rag_index_job_failed`: job ID, operation, safe error message, and request ID.
-- `rag_rate_limited`: client key, configured limit, window size, and retry delay
-  when a request receives HTTP 429, plus request ID.
-- `rag_cache_hit` and `rag_cache_miss`: whether a provider call was avoided for
-  a question, without logging the question text.
-- `rag_provider_circuit_rejected`: requests rejected during provider cooldown,
-  including the retry delay.
-- `rag_provider_fallback_used`: whether Ollama handled generation because the
-  primary provider failed or its circuit was open.
-- `http_request_completed`: method, path, status code, elapsed time, and request
-  ID for every API request.
-
-Use `LOG_LEVEL=INFO` locally or in deployment to keep these metrics visible.
-
-## CI
-
-GitHub Actions validates the project by installing dependencies, running unit
-tests and deterministic retrieval checks, and building the Docker image.
-
-## Dependency Management
-
-- `requirements.txt` contains direct dependencies that describe what the project
-  intentionally uses.
-- `requirements.lock.txt` pins the full resolved environment used by CI and
-  Docker.
-- Direct PDF extraction uses `pypdf`; the project depends only on the LangChain
-  integration packages it imports instead of the umbrella and community
-  packages.
-- After changing direct dependencies, regenerate the lock file with
-  `pip freeze > requirements.lock.txt` from a freshly installed environment.
+Report vulnerabilities privately using [`SECURITY.md`](SECURITY.md).
 
 ## Terraform
 
-The `terraform/` folder contains an Azure infrastructure draft for the future
-deployment path. Before production use, it should be extended with container
-image settings, secret management, managed identity, and deployment outputs.
+[`terraform/`](terraform/) contains an **Azure infrastructure draft**, not a
+complete deployment. It is independent of local startup. Container-image
+configuration, secret management, managed identity, and deployment outputs
+still need implementation and validation before use.
 
 ## License
 
-This project is available under the [MIT License](LICENSE).
+[MIT](LICENSE).

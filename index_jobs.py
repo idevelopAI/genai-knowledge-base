@@ -80,6 +80,7 @@ class IndexJobStore:
         status: str,
         result: dict[str, Any] | None = None,
         error: str | None = None,
+        filename: str | None = None,
     ) -> dict[str, Any] | None:
         with self._lock:
             job = self._jobs.get(job_id)
@@ -88,6 +89,8 @@ class IndexJobStore:
             job.status = status
             job.result = result
             job.error = error
+            if filename is not None:
+                job.filename = filename
             job.updated_at = self._timestamp()
             return asdict(job)
 

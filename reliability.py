@@ -115,6 +115,11 @@ class CircuitBreaker:
                 self._open_until = now + self.recovery_seconds
             self._probe_in_flight = False
 
+    def release_probe(self) -> None:
+        """Allow another recovery attempt after a non-transient call error."""
+        with self._lock:
+            self._probe_in_flight = False
+
     def snapshot(self) -> CircuitSnapshot:
         now = self._clock()
         with self._lock:

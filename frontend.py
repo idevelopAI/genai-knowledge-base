@@ -1,5 +1,6 @@
+import math
 import os
-import time
+from pathlib import Path
 from urllib.parse import quote
 
 import requests
@@ -7,51 +8,11 @@ import streamlit as st
 
 
 st.set_page_config(
-    page_title="GenAI Wissensdatenbank",
-    page_icon="🤖",
+    page_title="Knowledge Base",
+    page_icon=":material/menu_book:",
     layout="wide",
 )
-st.markdown(
-    """
-    <style>
-    h1 {
-        font-size: 40px !important;
-        line-height: 1.2 !important;
-        letter-spacing: 0 !important;
-    }
-    @media (min-width: 769px) {
-        section[data-testid="stSidebar"] {
-            width: 360px !important;
-        }
-        section[data-testid="stSidebar"] > div {
-            width: 360px !important;
-        }
-    }
-    @media (max-width: 768px) {
-        [data-testid="stMainBlockContainer"] {
-            box-sizing: border-box !important;
-            max-width: 100% !important;
-            padding-left: 16px !important;
-            padding-right: 16px !important;
-        }
-        h1 {
-            font-size: 24px !important;
-            overflow-wrap: anywhere !important;
-        }
-        [data-testid="stMainBlockContainer"] p {
-            overflow-wrap: anywhere !important;
-        }
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-st.title("🤖 Interaktive Wissensdatenbank")
-st.markdown(
-    "Stelle Fragen an deine internen Dokumente. Die KI antwortet basierend "
-    "auf dem bereitgestellten Kontext."
-)
+st.html(Path(__file__).with_name("frontend.css"))
 
 API_URL = os.environ.get("RAG_API_URL", "http://127.0.0.1:8000/ask")
 API_BASE_URL = API_URL.removesuffix("/ask")
@@ -62,203 +23,447 @@ RAG_API_TOKEN = os.environ.get("RAG_API_TOKEN")
 
 
 def auth_headers():
-    if not RAG_API_TOKEN:
-        return {}
-    return {"Authorization": f"Bearer {RAG_API_TOKEN}"}
+    return {"Authorization": f"Bearer {RAG_API_TOKEN}"} if RAG_API_TOKEN else {}
+
+
+def request_error(error):
+    response = getattr(error, "response", None)
+    if response is not None:
+        status = response.status_code
+        if status == 401:
+            message = (
+                "Zugriff verweigert. Der API-Token fehlt oder stimmt nicht überein."
+            )
+        elif status == 429:
+            message = "Zu viele Anfragen. Bitte kurz warten."
+        elif status == 503:
+            message = "Der Dienst ist vorübergehend nicht verfügbar."
+        elif status == 413:
+            message = "Die PDF-Datei überschreitet das Upload-Limit."
+        elif status == 409:
+            message = "Die Aktion ist aktuell nicht möglich. Bitte die Dokumentliste aktualisieren."
+        elif status in {400, 422}:
+            message = (
+                "Ungültige Anfrage. Bitte Datei, Frage und Dokumentauswahl prüfen."
+            )
+        else:
+            message = "Die Anfrage konnte nicht abgeschlossen werden."
+        retry_after = response.headers.get("Retry-After", "")
+        if retry_after.isdigit():
+            message += f" Erneut versuchen in {retry_after} Sekunden."
+        return {"message": message, "request_id": response.headers.get("X-Request-ID")}
+    if isinstance(error, requests.Timeout):
+        return {
+            "message": "Die Anfrage dauert zu lange. Bitte später erneut versuchen."
+        }
+    return {"message": "Keine Verbindung zur API. Bitte den Backend-Status prüfen."}
+
+
+def show_error(error):
+    st.error(error["message"], icon=":material/error_outline:")
+    if error.get("request_id"):
+        st.caption(f"Anfrage: {error['request_id']}")
+
+
+def load_backend_state():
+    try:
+        response = requests.get(DOCUMENTS_URL, headers=auth_headers(), timeout=10)
+        response.raise_for_status()
+        documents = response.json()["documents"]
+        response = requests.get(f"{API_BASE_URL}/health", timeout=10)
+        response.raise_for_status()
+        return documents, response.json(), None
+    except requests.RequestException as error:
+        return [], {}, request_error(error)
+    except (ValueError, KeyError):
+        return [], {}, {"message": "Die API hat eine ungültige Antwort geliefert."}
+
+
+def answer_timeout(health):
+    configured = os.environ.get("RAG_REQUEST_TIMEOUT_SECONDS", "").strip()
+    try:
+        return max(1, int(configured or health.get("answer_timeout_seconds", 240)))
+    except (ValueError, TypeError):
+        return 240
 
 
 def render_sources(sources):
     if not sources:
         return
-
-    with st.expander("Quellen"):
+    label = "1 Quelle" if len(sources) == 1 else f"{len(sources)} Quellen"
+    with st.expander(label, icon=":material/description:"):
         for index, source in enumerate(sources, start=1):
+            if index > 1:
+                st.divider()
             page = source.get("page")
-            page_text = f", Seite {page}" if page else ""
-            st.markdown(f"**{index}. {source.get('source', 'unknown')}{page_text}**")
-            st.caption(source.get("excerpt", ""))
+            page_label = f" · Seite {page}" if page else ""
+            st.text(f"[Source {index}] {source.get('source', 'Dokument')}{page_label}")
+            st.text(source.get("excerpt", ""))
 
 
-def refresh_document_list():
+def conversation_markdown():
+    parts = ["# Knowledge Base\n"]
+    for message in st.session_state.messages:
+        title = "Frage" if message["role"] == "user" else "Antwort"
+        content = message.get("content", message.get("error", {}).get("message", ""))
+        parts.append(f"## {title}\n\n{content}\n")
+        for index, source in enumerate(message.get("sources", []), start=1):
+            parts.append(
+                f"[Source {index}] {source.get('source', 'Dokument')}, "
+                f"Seite {source.get('page', '?')}\n\n{source.get('excerpt', '')}\n"
+            )
+    return "\n".join(parts)
+
+
+def queue_question(question=None):
+    question = question or st.session_state.question_input
+    st.session_state.messages.append({"role": "user", "content": question})
+    st.session_state.pending_question = question
+
+
+def retry_question():
+    st.session_state.messages.pop()
+    st.session_state.pending_question = st.session_state.messages[-1]["content"]
+
+
+def clear_chat():
+    st.session_state.messages = []
+    st.session_state.pop("pending_question", None)
+
+
+def start_index_job(method, url, **kwargs):
     try:
-        response = requests.get(DOCUMENTS_URL, headers=auth_headers(), timeout=10)
+        response = method(url, headers=auth_headers(), timeout=30, **kwargs)
         response.raise_for_status()
-        return response.json().get("documents", [])
-    except requests.exceptions.RequestException:
-        return []
+        job = response.json()
+        if "job_id" not in job:
+            raise ValueError("Missing job ID")
+        st.session_state.pending_job = job
+        st.rerun()
+    except requests.RequestException as error:
+        show_error(request_error(error))
+    except ValueError:
+        st.error("Die API hat keinen gültigen Auftrag zurückgegeben.")
 
 
-def wait_for_index_job(job, timeout=180):
-    job_id = job["job_id"]
-    deadline = time.monotonic() + timeout
-    current = job
-
-    while current.get("status") in {"queued", "running"}:
-        if time.monotonic() >= deadline:
-            raise RuntimeError("Zeitueberschreitung bei der Indexierung.")
-        time.sleep(1)
+@st.fragment(run_every=2)
+def render_index_job():
+    job = st.session_state.get("pending_job")
+    if not job:
+        return
+    try:
         response = requests.get(
-            f"{JOBS_URL}/{job_id}",
-            headers=auth_headers(),
-            timeout=10,
+            f"{JOBS_URL}/{job['job_id']}", headers=auth_headers(), timeout=10
         )
         response.raise_for_status()
         current = response.json()
+    except requests.RequestException as error:
+        show_error(request_error(error))
+        if st.button("Status schließen", key="dismiss_job", icon=":material/close:"):
+            st.session_state.pop("pending_job", None)
+            st.rerun()
+        return
+    except ValueError:
+        st.warning("Der Auftragsstatus konnte nicht gelesen werden.")
+        return
 
-    if current.get("status") == "failed":
-        raise RuntimeError(current.get("error") or "Indexierung fehlgeschlagen.")
-    if current.get("status") != "completed" or not current.get("result"):
-        raise RuntimeError("Ungueltiger Status der Indexierung.")
-    return current["result"]
+    if current.get("status") in {"queued", "running"}:
+        label = (
+            "Wartet auf Indexierung"
+            if current["status"] == "queued"
+            else "Index wird aktualisiert"
+        )
+        with st.status(label, expanded=False):
+            if current.get("filename"):
+                st.text(current["filename"])
+        return
 
-
-with st.sidebar:
-    st.header("Dokumente")
-    if operation_message := st.session_state.pop("document_operation_message", None):
-        st.success(operation_message)
-
-    documents = refresh_document_list()
-    if documents:
-        for document in documents:
-            st.caption(document)
+    st.session_state.pop("pending_job", None)
+    if current.get("status") == "completed":
+        st.session_state.messages = []
+        st.session_state.upload_version += 1
+        st.session_state.document_notice = "Index aktualisiert."
+        if current.get("operation") == "upload" and current.get("filename"):
+            st.session_state.select_after_refresh = current["filename"]
     else:
-        st.caption("Keine Dokumente gefunden oder Backend nicht erreichbar.")
+        st.session_state.document_error = {
+            "message": "Die Indexierung ist fehlgeschlagen. Bitte den Backend-Status prüfen.",
+            "request_id": current.get("request_id"),
+        }
+    st.rerun()
 
+
+@st.dialog("Dokument löschen", icon=":material/delete_outline:")
+def confirm_deletion(filename):
+    st.text(filename)
+    st.warning("Die PDF-Datei wird entfernt und der Index neu erstellt.")
+    cancel, confirm = st.columns(2)
+    if cancel.button("Abbrechen", width="stretch"):
+        st.rerun()
+    if confirm.button(
+        "Löschen", icon=":material/delete:", type="primary", width="stretch"
+    ):
+        start_index_job(requests.delete, f"{DOCUMENTS_URL}/{quote(filename, safe='')}")
+
+
+st.session_state.setdefault("messages", [])
+st.session_state.setdefault("upload_version", 0)
+documents, health, backend_error = load_backend_state()
+busy = bool(st.session_state.get("pending_job"))
+
+# An explicit empty selection must stay empty, including across API outages.
+if backend_error is None:
+    st.session_state.available_documents = documents
     current_selection = st.session_state.get("selected_documents", documents)
     st.session_state.selected_documents = [
-        document for document in current_selection if document in documents
+        name for name in current_selection if name in documents
     ]
-    if documents and not st.session_state.selected_documents:
-        st.session_state.selected_documents = documents
-
-    selected_documents = st.multiselect(
-        "Dokumentauswahl",
-        options=documents,
-        key="selected_documents",
-        disabled=not documents,
-    )
-
-    document_to_delete = st.selectbox(
-        "Dokument loeschen",
-        options=documents,
-        index=None,
-        placeholder="PDF auswaehlen",
-        disabled=len(documents) <= 1,
-    )
-    if st.button(
-        "Ausgewaehltes Dokument loeschen",
-        disabled=document_to_delete is None or len(documents) <= 1,
+    new_document = st.session_state.pop("select_after_refresh", None)
+    if (
+        new_document in documents
+        and new_document not in st.session_state.selected_documents
     ):
-        with st.spinner("Dokument wird geloescht und der Index aktualisiert..."):
-            try:
-                response = requests.delete(
-                    f"{DOCUMENTS_URL}/{quote(document_to_delete, safe='')}",
-                    headers=auth_headers(),
-                    timeout=30,
-                )
-                response.raise_for_status()
-                payload = wait_for_index_job(response.json())
-                st.session_state.document_operation_message = (
-                    "Dokument geloescht: "
-                    f"{payload['pdf_count']} PDFs, {payload['chunks_created']} Chunks."
-                )
-                st.session_state.messages = []
-                st.rerun()
-            except (requests.exceptions.RequestException, RuntimeError) as e:
-                st.error(f"Loeschen fehlgeschlagen: {str(e)}")
+        st.session_state.selected_documents.append(new_document)
 
-    uploaded_file = st.file_uploader("PDF hochladen", type=["pdf"])
-    if st.button("Hochladen und indexieren", disabled=uploaded_file is None):
-        with st.spinner("Dokument wird indexiert..."):
-            try:
-                files = {
+with st.sidebar:
+    with st.container(key="brand"):
+        st.markdown("**Knowledge Base**")
+        st.caption("Dokumente & Wissen")
+    st.divider()
+
+    title, refresh = st.columns([5, 1], vertical_alignment="center")
+    title.subheader("Bibliothek")
+    refresh.button(
+        "", icon=":material/refresh:", help="Dokumentliste aktualisieren", key="refresh"
+    )
+    if notice := st.session_state.pop("document_notice", None):
+        st.success(notice)
+    if error := st.session_state.pop("document_error", None):
+        show_error(error)
+    if backend_error:
+        show_error(backend_error)
+
+    library_tab, upload_tab = st.tabs(["Dokumente", "Hochladen"])
+    with library_tab:
+        st.caption(
+            f"{len(documents)} PDF-Dokumente"
+            if not backend_error
+            else "Nicht verfügbar"
+        )
+        selected_documents = st.multiselect(
+            "Suchbereich",
+            options=st.session_state.get("available_documents", []),
+            key="selected_documents",
+            placeholder="Dokumente auswählen",
+            disabled=not documents or busy or bool(backend_error),
+        )
+        if documents and not selected_documents and not backend_error:
+            st.caption("Kein Dokument ausgewählt.")
+        elif not documents and not backend_error:
+            st.caption("Noch keine Dokumente vorhanden.")
+
+        with st.expander("Verwalten", icon=":material/tune:"):
+            document_to_delete = st.selectbox(
+                "Dokument",
+                options=documents,
+                index=None,
+                placeholder="PDF auswählen",
+                disabled=len(documents) <= 1 or busy,
+            )
+            if st.button(
+                "Dokument löschen",
+                icon=":material/delete_outline:",
+                disabled=document_to_delete is None or len(documents) <= 1 or busy,
+                width="stretch",
+            ):
+                confirm_deletion(document_to_delete)
+            if len(documents) == 1:
+                st.caption("Das letzte Dokument bleibt erhalten.")
+            st.divider()
+            if st.button(
+                "Index neu erstellen",
+                icon=":material/sync:",
+                disabled=not documents or busy or bool(backend_error),
+                width="stretch",
+            ):
+                start_index_job(requests.post, REINDEX_URL)
+
+    with upload_tab:
+        uploaded_file = st.file_uploader(
+            "PDF-Datei",
+            type=["pdf"],
+            disabled=busy or bool(backend_error),
+            key=f"upload_{st.session_state.upload_version}",
+            max_upload_size=max(
+                1,
+                math.ceil(
+                    health.get("max_upload_bytes", 10 * 1024 * 1024) / (1024 * 1024)
+                ),
+            ),
+            help=f"Maximal {health.get('max_pdf_pages', 200)} Seiten pro PDF.",
+        )
+        if st.button(
+            "Hochladen & indexieren",
+            icon=":material/upload_file:",
+            type="primary",
+            disabled=uploaded_file is None or busy or bool(backend_error),
+            width="stretch",
+        ):
+            start_index_job(
+                requests.post,
+                DOCUMENTS_URL,
+                files={
                     "file": (
                         uploaded_file.name,
                         uploaded_file.getvalue(),
                         "application/pdf",
                     )
-                }
-                response = requests.post(
-                    DOCUMENTS_URL,
-                    files=files,
-                    headers=auth_headers(),
-                    timeout=30,
-                )
-                response.raise_for_status()
-                payload = wait_for_index_job(response.json())
-                st.session_state.document_operation_message = (
-                    "Index aktualisiert: "
-                    f"{payload['pdf_count']} PDFs, {payload['chunks_created']} Chunks."
-                )
-                st.session_state.messages = []
-                st.rerun()
-            except (requests.exceptions.RequestException, RuntimeError) as e:
-                st.error(f"Upload fehlgeschlagen: {str(e)}")
+                },
+            )
 
-    if st.button("Index neu erstellen"):
-        with st.spinner("Index wird neu erstellt..."):
+    render_index_job()
+    st.divider()
+    with st.container(key="connection"):
+        if backend_error:
+            st.caption(":material/cloud_off: API nicht erreichbar")
+        elif not health.get("rag_ready"):
+            st.caption(":material/settings: Konfiguration erforderlich")
+        elif health.get("provider_circuit_state") == "open":
+            st.caption(":material/hourglass_top: Gemini pausiert")
+        else:
+            st.caption(":material/check_circle: API verbunden")
+        if health.get("ollama_fallback_enabled"):
+            st.caption("Ollama-Fallback aktiviert")
+
+chat_disabled = (
+    not selected_documents or busy or bool(backend_error) or not health.get("rag_ready")
+)
+with st.container(key="chat_header"):
+    heading, actions = st.columns([4, 1], vertical_alignment="center")
+    with heading:
+        st.caption("WISSENSDATENBANK")
+        st.title("Dokument-Chat")
+        scope = (
+            "1 Dokument"
+            if len(selected_documents) == 1
+            else f"{len(selected_documents)} Dokumente"
+        )
+        st.caption(f"{scope} im Suchbereich")
+st.divider()
+
+if not st.session_state.messages:
+    with st.container(key="empty_chat"):
+        st.subheader("Neuer Chat")
+        if backend_error:
+            st.caption("Warten auf die API-Verbindung.")
+        elif not health.get("rag_ready"):
+            st.caption("Die Modell-Konfiguration ist noch nicht vollständig.")
+        elif not selected_documents:
+            st.caption("Kein Dokument im Suchbereich.")
+        else:
+            st.caption("Ausgewählte Dokumente")
+            for name in selected_documents[:3]:
+                st.text(name)
+            if len(selected_documents) > 3:
+                st.caption(f"+ {len(selected_documents) - 3} weitere")
+            with st.container(key="suggestions"):
+                for question, icon in (
+                    ("Was sind die Kernaussagen?", ":material/short_text:"),
+                    ("Welche Schritte werden beschrieben?", ":material/checklist:"),
+                ):
+                    st.button(
+                        question,
+                        icon=icon,
+                        disabled=chat_disabled,
+                        width="stretch",
+                        on_click=queue_question,
+                        args=(question,),
+                    )
+
+for index, message in enumerate(st.session_state.messages):
+    avatar = (
+        ":material/person:" if message["role"] == "user" else ":material/menu_book:"
+    )
+    with st.chat_message(message["role"], avatar=avatar):
+        st.caption("Du" if message["role"] == "user" else "Knowledge Base")
+        if message.get("error"):
+            show_error(message["error"])
+            if index == len(st.session_state.messages) - 1:
+                st.button(
+                    "Erneut versuchen",
+                    icon=":material/refresh:",
+                    disabled=chat_disabled,
+                    on_click=retry_question,
+                )
+        else:
+            st.markdown(message["content"])
+            render_sources(message.get("sources", []))
+
+st.chat_input(
+    "Frage zu deinen Dokumenten",
+    max_chars=2000,
+    disabled=chat_disabled,
+    key="question_input",
+    on_submit=queue_question,
+)
+question = st.session_state.pop("pending_question", None)
+if question and not chat_disabled:
+    with st.chat_message("assistant", avatar=":material/menu_book:"):
+        st.caption("Knowledge Base")
+        with st.spinner("Dokumente werden durchsucht …"):
             try:
                 response = requests.post(
-                    REINDEX_URL,
+                    API_URL,
+                    json={"question": question, "documents": selected_documents},
                     headers=auth_headers(),
-                    timeout=30,
+                    timeout=(10, answer_timeout(health)),
                 )
                 response.raise_for_status()
-                payload = wait_for_index_job(response.json())
-                st.session_state.document_operation_message = (
-                    "Index aktualisiert: "
-                    f"{payload['pdf_count']} PDFs, {payload['chunks_created']} Chunks."
-                )
-                st.session_state.messages = []
-                st.rerun()
-            except (requests.exceptions.RequestException, RuntimeError) as e:
-                st.error(f"Reindex fehlgeschlagen: {str(e)}")
-
-
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-        render_sources(message.get("sources", []))
-
-chat_disabled = not documents or not selected_documents
-if prompt := st.chat_input(
-    "Deine Frage an die ausgewaehlten Dokumente...",
-    disabled=chat_disabled,
-):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
-    with st.chat_message("assistant"):
-        message_placeholder = st.empty()
-        message_placeholder.markdown("*(KI ueberlegt...)*")
-
-        try:
-            response = requests.post(
-                API_URL,
-                json={"question": prompt, "documents": selected_documents},
-                headers=auth_headers(),
-                timeout=60,
+                payload = response.json()
+                message = {
+                    "role": "assistant",
+                    "content": payload["answer"],
+                    "sources": payload.get("sources", []),
+                }
+            except requests.RequestException as error:
+                message = {"role": "assistant", "error": request_error(error)}
+            except (ValueError, KeyError):
+                message = {
+                    "role": "assistant",
+                    "error": {"message": "Die Antwort konnte nicht gelesen werden."},
+                }
+        st.session_state.messages.append(message)
+        if message.get("error"):
+            show_error(message["error"])
+            st.button(
+                "Erneut versuchen", icon=":material/refresh:", on_click=retry_question
             )
-            response.raise_for_status()
+        else:
+            st.markdown(message["content"])
+            render_sources(message.get("sources", []))
+elif question:
+    error = backend_error or {
+        "message": "Die Frage konnte nicht gesendet werden. Bitte den Suchbereich prüfen."
+    }
+    st.session_state.messages.append({"role": "assistant", "error": error})
+    show_error(error)
 
-            payload = response.json()
-            answer = payload["answer"]
-            sources = payload.get("sources", [])
-
-            message_placeholder.markdown(answer)
-            render_sources(sources)
-
-            st.session_state.messages.append(
-                {"role": "assistant", "content": answer, "sources": sources}
-            )
-
-        except requests.exceptions.RequestException as e:
-            error_msg = (
-                "Fehler: Das Backend ist nicht erreichbar oder konnte nicht antworten. "
-                f"Laeuft der API-Server? ({str(e)})"
-            )
-            message_placeholder.error(error_msg)
+with actions:
+    with st.container(horizontal=True, horizontal_alignment="right"):
+        st.download_button(
+            "",
+            conversation_markdown(),
+            "knowledge-base-chat.md",
+            "text/markdown",
+            icon=":material/download:",
+            help="Chat herunterladen",
+            disabled=not st.session_state.messages,
+        )
+        st.button(
+            "",
+            icon=":material/edit_square:",
+            help="Neuer Chat",
+            key="new_chat",
+            disabled=not st.session_state.messages,
+            on_click=clear_chat,
+        )

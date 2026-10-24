@@ -4,7 +4,7 @@ services:
     env_file:
       - .env
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -18,8 +18,9 @@ services:
       RAG_DOCUMENTS_URL: http://backend:8000/documents
       RAG_REINDEX_URL: http://backend:8000/reindex
       RAG_API_TOKEN: ${RAG_API_TOKEN:-}
+      RAG_REQUEST_TIMEOUT_SECONDS: ${RAG_REQUEST_TIMEOUT_SECONDS:-}
     command: streamlit run frontend.py --server.address 0.0.0.0 --server.port 8501
     ports:
-      - "8501:8501"
+      - "127.0.0.1:8501:8501"
     depends_on:
       - backend

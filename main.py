@@ -4,6 +4,7 @@ import logging
 import math
 import os
 import re
+import tempfile
 import threading
 import time
 import uuid
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+import httpx
 from fastapi import (
     Depends,
     FastAPI,
@@ -43,6 +45,7 @@ from rag_index import (
     delete_collection,
     get_active_collection_name,
     list_pdf_files,
+    next_available_path,
     sanitize_filename,
     save_pdf_bytes,
     set_active_collection_name,
@@ -337,10 +340,20 @@ def _elapsed_ms(start_time: float) -> int:
 
 
 def _provider_status_code(exc: Exception) -> int | None:
-    for attribute in ("status_code", "code"):
-        value = getattr(exc, attribute, None)
-        if isinstance(value, int):
-            return value
+    # LangChain wraps Google client errors; the status lives on the cause.
+    current: BaseException | None = exc
+    seen = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (TimeoutError, httpx.TimeoutException)):
+            return 504
+        if isinstance(current, (ConnectionError, httpx.TransportError)):
+            return 503
+        for attribute in ("status_code", "code"):
+            value = getattr(current, attribute, None)
+            if isinstance(value, int):
+                return value
+        current = current.__cause__ or current.__context__
     return None
 
 
@@ -733,6 +746,17 @@ def _remove_uploaded_file(path: Path, request_id: str) -> None:
         )
 
 
+def _discard_staged_upload(path: Path, request_id: str) -> None:
+    _remove_uploaded_file(path, request_id)
+    if path.parent.name.startswith(".upload-"):
+        try:
+            path.parent.rmdir()
+        except OSError:
+            logger.warning(
+                "rag_upload_staging_cleanup_failed request_id=%s", request_id
+            )
+
+
 def _restore_deleted_file(path: Path, backup_path: Path, request_id: str) -> None:
     try:
         if backup_path.exists() and not path.exists():
@@ -763,29 +787,49 @@ def _run_index_job(
     request_id: str,
     uploaded_path: Path | None = None,
     deleted_path: Path | None = None,
-    deletion_backup_path: Path | None = None,
     upload_bytes: int | None = None,
     page_count: int | None = None,
 ) -> None:
     index_job_store.update(job_id, status="running")
     started_at = time.perf_counter()
+    active_upload_path = None
+    deletion_backup_path = None
 
     try:
+        # Only the serialized worker may change the PDFs used by a rebuild.
+        if uploaded_path is not None:
+            destination = next_available_path(Path(DATA_DIR), uploaded_path.name)
+            uploaded_path.replace(destination)
+            active_upload_path = destination
+            index_job_store.update(
+                job_id, status="running", filename=active_upload_path.name
+            )
+        if deleted_path is not None:
+            deleted_path = _document_path(deleted_path.name)
+            if len(list_pdf_files(DATA_DIR)) <= 1:
+                raise HTTPException(
+                    status_code=409,
+                    detail="The last document cannot be deleted from the knowledge base.",
+                )
+            deletion_backup_path = deleted_path.with_name(
+                f".{deleted_path.name}.{uuid.uuid4().hex}.deleting"
+            )
+            deleted_path.replace(deletion_backup_path)
+
         stats = _rebuild_vector_store(request_id=request_id)
         result_status = {
             "upload": "uploaded_and_indexed",
             "delete": "deleted_and_indexed",
         }.get(operation, "reindexed")
         result = _index_response(stats, status=result_status).model_dump()
-        index_job_store.update(job_id, status="completed", result=result)
 
-        if uploaded_path is not None:
+        if active_upload_path is not None:
             logger.info(
                 "rag_document_uploaded request_id=%s job_id=%s filename=%s "
                 "bytes=%s pages=%s pdf_count=%s chunks_created=%s elapsed_ms=%s",
                 request_id,
                 job_id,
-                uploaded_path.name,
+                active_upload_path.name,
                 upload_bytes,
                 page_count,
                 stats.pdf_count,
@@ -804,9 +848,10 @@ def _run_index_job(
                 stats.chunks_created,
                 _elapsed_ms(started_at),
             )
+        index_job_store.update(job_id, status="completed", result=result)
     except Exception as exc:
-        if uploaded_path is not None:
-            _remove_uploaded_file(uploaded_path, request_id)
+        if active_upload_path is not None:
+            _remove_uploaded_file(active_upload_path, request_id)
         if deleted_path is not None and deletion_backup_path is not None:
             _restore_deleted_file(deleted_path, deletion_backup_path, request_id)
 
@@ -822,6 +867,9 @@ def _run_index_job(
             operation,
             error,
         )
+    finally:
+        if uploaded_path is not None:
+            _discard_staged_upload(uploaded_path, request_id)
 
 
 def _submit_index_job(
@@ -830,7 +878,6 @@ def _submit_index_job(
     request_id: str,
     uploaded_path: Path | None = None,
     deleted_path: Path | None = None,
-    deletion_backup_path: Path | None = None,
     upload_bytes: int | None = None,
     page_count: int | None = None,
 ) -> dict[str, Any]:
@@ -844,9 +891,7 @@ def _submit_index_job(
         )
     except JobCapacityError as exc:
         if uploaded_path is not None:
-            _remove_uploaded_file(uploaded_path, request_id)
-        if deleted_path is not None and deletion_backup_path is not None:
-            _restore_deleted_file(deleted_path, deletion_backup_path, request_id)
+            _discard_staged_upload(uploaded_path, request_id)
         raise HTTPException(
             status_code=503,
             detail="The index job queue is full. Try again later.",
@@ -861,15 +906,12 @@ def _submit_index_job(
             request_id=request_id,
             uploaded_path=uploaded_path,
             deleted_path=deleted_path,
-            deletion_backup_path=deletion_backup_path,
             upload_bytes=upload_bytes,
             page_count=page_count,
         )
     except RuntimeError as exc:
         if uploaded_path is not None:
-            _remove_uploaded_file(uploaded_path, request_id)
-        if deleted_path is not None and deletion_backup_path is not None:
-            _restore_deleted_file(deleted_path, deletion_backup_path, request_id)
+            _discard_staged_upload(uploaded_path, request_id)
         index_job_store.update(
             job["job_id"],
             status="failed",
@@ -906,8 +948,8 @@ def _document_path(filename: str) -> Path:
         raise HTTPException(status_code=404, detail="Document not found.")
 
     data_directory = Path(DATA_DIR).resolve()
-    document_path = (data_directory / filename).resolve()
-    if document_path.parent != data_directory or not document_path.is_file():
+    document_path = data_directory / filename
+    if document_path.is_symlink() or not document_path.is_file():
         raise HTTPException(status_code=404, detail="Document not found.")
     return document_path
 
@@ -954,6 +996,7 @@ def _generate_answer(
     except Exception as exc:
         provider_status = _provider_status_code(exc)
         if provider_status not in {429, 500, 502, 503, 504}:
+            provider_circuit.release_probe()
             raise
 
         provider_circuit.record_failure()
@@ -988,11 +1031,19 @@ async def health() -> dict[str, bool | str | int | float]:
             else "unconfigured"
         ),
         "ollama_fallback_enabled": fallback_provider is not None,
+        "answer_timeout_seconds": max(
+            180,
+            GEMINI_REQUEST_TIMEOUT_SECONDS * (GEMINI_MAX_RETRIES + 1)
+            + (OLLAMA_REQUEST_TIMEOUT_SECONDS if fallback_provider is not None else 0)
+            + 60,
+        ),
         "top_k": RAG_TOP_K,
         "min_relevance_score": RAG_MIN_RELEVANCE_SCORE,
         "answer_cache_enabled": answer_cache.enabled,
         "provider_circuit_state": circuit.state,
         "pdf_count": len(list_pdf_files(DATA_DIR)),
+        "max_upload_bytes": RAG_MAX_UPLOAD_BYTES,
+        "max_pdf_pages": RAG_MAX_PDF_PAGES,
     }
 
 
@@ -1069,7 +1120,15 @@ async def upload_document(
 
     _require_google_api_key()
 
-    saved_path = save_pdf_bytes(contents, filename, DATA_DIR)
+    Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
+    staging_directory = Path(tempfile.mkdtemp(prefix=".upload-", dir=DATA_DIR))
+    try:
+        saved_path = save_pdf_bytes(contents, filename, str(staging_directory))
+    except OSError:
+        _discard_staged_upload(
+            staging_directory / sanitize_filename(filename), _request_id(request)
+        )
+        raise HTTPException(status_code=500, detail="Unable to stage the uploaded PDF.")
     job = _submit_index_job(
         operation="upload",
         request_id=_request_id(request),
@@ -1100,22 +1159,10 @@ async def delete_document(
             detail="The last document cannot be deleted from the knowledge base.",
         )
 
-    backup_path = document_path.with_name(
-        f".{document_path.name}.{uuid.uuid4().hex}.deleting"
-    )
-    try:
-        document_path.replace(backup_path)
-    except OSError as exc:
-        raise HTTPException(
-            status_code=500,
-            detail="Unable to stage the document for deletion.",
-        ) from exc
-
     job = _submit_index_job(
         operation="delete",
         request_id=_request_id(request),
         deleted_path=document_path,
-        deletion_backup_path=backup_path,
     )
     response.headers["Location"] = f"/jobs/{job['job_id']}"
     return IndexJobResponse.model_validate(job)
