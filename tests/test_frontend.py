@@ -54,6 +54,105 @@ def backend(monkeypatch):
     return state
 
 
+@pytest.mark.parametrize(
+    "state,label",
+    [
+        ("empty", "Kein durchsuchbarer Index"),
+        ("needs_rebuild", "Index muss neu erstellt werden"),
+        ("needs_reload", "Backend-Neustart erforderlich"),
+        ("unavailable", "Index nicht verfügbar"),
+    ],
+)
+def test_index_state_is_distinct_from_api_connectivity(backend, state, label):
+    backend["health"].update(rag_ready=False, model_configured=True, index_state=state)
+    app = AppTest.from_file(str(FRONTEND)).run()
+    assert not app.exception
+    assert app.chat_input[0].disabled
+    assert any("API verbunden" in caption.value for caption in app.caption)
+    assert any(label in caption.value for caption in app.caption)
+    backend["post"].assert_not_called()
+
+
+def test_source_preview_starts_at_cited_page_and_keeps_token_server_side(
+    backend, monkeypatch
+):
+    from io import BytesIO
+    from PIL import Image
+
+    original_get = requests.get
+    image = BytesIO()
+    Image.new("RGB", (20, 30), "white").save(image, format="PNG")
+    requests_seen = []
+
+    def get(url, **kwargs):
+        if "/documents/" not in url:
+            return original_get(url, **kwargs)
+        requests_seen.append((url, kwargs))
+        if url.endswith("/first.pdf"):
+            return response(
+                {"filename": "first.pdf", "revision": "a" * 64, "page_count": 4}
+            )
+        result = response({})
+        result._content = b"%PDF-test" if url.endswith("/file") else image.getvalue()
+        return result
+
+    monkeypatch.setattr(requests, "get", get)
+    monkeypatch.setenv("RAG_API_TOKEN", "preview-test-token")
+    app = AppTest.from_file(str(FRONTEND)).run()
+    app.session_state["messages"] = [
+        {
+            "role": "assistant",
+            "content": "Answer",
+            "sources": [
+                {
+                    "source": "first.pdf",
+                    "page": 3,
+                    "excerpt": "Text",
+                    "revision": "a" * 64,
+                }
+            ],
+        }
+    ]
+    app.run()
+    app.button(key="source_0_1").click().run()
+    assert not app.exception
+    assert app.number_input(key="preview_page").value == 3
+    assert any(url.endswith("/pages/3") for url, _ in requests_seen)
+    assert all("preview-test-token" not in url for url, _ in requests_seen)
+    assert all(
+        kwargs["headers"] == {"Authorization": "Bearer preview-test-token"}
+        for _, kwargs in requests_seen
+    )
+    assert all(
+        kwargs["params"] == {"revision": "a" * 64} for _, kwargs in requests_seen
+    )
+    assert len(app.get("download_button")) == 2
+
+
+@pytest.mark.parametrize(
+    "status,text", [(404, "nicht mehr verfügbar"), (409, "geändert")]
+)
+def test_missing_or_changed_source_has_clear_preview_error(
+    backend, monkeypatch, status, text
+):
+    original_get = requests.get
+    monkeypatch.setattr(
+        requests,
+        "get",
+        lambda url, **kwargs: (
+            response({"detail": "private detail"}, status=status)
+            if "/documents/" in url
+            else original_get(url, **kwargs)
+        ),
+    )
+    app = AppTest.from_file(str(FRONTEND)).run()
+    app.chat_input[0].set_value("Question").run()
+    app.button(key="source_1_1").click().run()
+    assert not app.exception
+    assert any(text in warning.value for warning in app.warning)
+    assert "private detail" not in str(app.warning)
+
+
 def test_clear_selection_stays_empty_and_disables_chat(backend):
     app = AppTest.from_file(str(FRONTEND)).run()
     assert not app.exception

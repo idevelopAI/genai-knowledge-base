@@ -87,7 +87,80 @@ def answer_timeout(health):
         return 240
 
 
-def render_sources(sources):
+@st.dialog("Dokumentvorschau", width="large", icon=":material/description:")
+def preview_source(source):
+    filename = source["source"]
+    url = f"{DOCUMENTS_URL}/{quote(filename, safe='')}"
+    st.text(filename)
+    try:
+        response = requests.get(
+            url,
+            params={"revision": source.get("revision")},
+            headers=auth_headers(),
+            timeout=15,
+        )
+        response.raise_for_status()
+        details = response.json()
+        params = {"revision": details["revision"]}
+        page_count = int(details["page_count"])
+        if not 1 <= st.session_state.preview_page <= page_count:
+            st.warning("Die angegebene Seite ist nicht verfügbar.")
+            return
+        with st.container(horizontal=True, vertical_alignment="bottom"):
+            page = st.number_input(
+                "Seite",
+                min_value=1,
+                max_value=page_count,
+                step=1,
+                key="preview_page",
+                width=160,
+            )
+            scale = st.segmented_control(
+                "Ansicht",
+                ["Ganze Seite", "Seitenbreite"],
+                default="Ganze Seite",
+                required=True,
+                key="preview_scale",
+                label_visibility="collapsed",
+            )
+        st.caption(f"Seite {page} von {page_count}")
+        response = requests.get(
+            f"{url}/pages/{page}", params=params, headers=auth_headers(), timeout=30
+        )
+        response.raise_for_status()
+        with st.container(
+            key="pdf_preview_width" if scale == "Seitenbreite" else "pdf_preview_fit"
+        ):
+            st.image(response.content, width="stretch", output_format="PNG")
+        cached = st.session_state.get("preview_download", {})
+        if cached.get("revision") != details["revision"]:
+            response = requests.get(
+                f"{url}/file", params=params, headers=auth_headers(), timeout=30
+            )
+            response.raise_for_status()
+            cached = {"revision": details["revision"], "contents": response.content}
+            st.session_state.preview_download = cached
+        st.download_button(
+            "PDF herunterladen",
+            cached["contents"],
+            filename,
+            "application/pdf",
+            icon=":material/download:",
+            on_click="ignore",
+        )
+    except requests.RequestException as error:
+        status = getattr(getattr(error, "response", None), "status_code", None)
+        if status == 404:
+            st.warning("Dieses Dokument ist nicht mehr verfügbar.")
+        elif status == 409:
+            st.warning("Das Dokument wurde seit dieser Antwort geändert.")
+        else:
+            show_error(request_error(error))
+    except (ValueError, KeyError, TypeError):
+        st.error("Die Dokumentvorschau konnte nicht geladen werden.")
+
+
+def render_sources(sources, message_index):
     if not sources:
         return
     label = "1 Quelle" if len(sources) == 1 else f"{len(sources)} Quellen"
@@ -99,6 +172,29 @@ def render_sources(sources):
             page_label = f" · Seite {page}" if page else ""
             st.text(f"[Source {index}] {source.get('source', 'Dokument')}{page_label}")
             st.text(source.get("excerpt", ""))
+            if st.button(
+                "Quelle öffnen",
+                icon=":material/open_in_new:",
+                key=f"source_{message_index}_{index}",
+            ):
+                st.session_state.preview_page = page or 1
+                preview_source(source)
+
+
+def index_status_label(health):
+    state = health.get("index_state")
+    return {
+        "unconfigured": "Modell-Konfiguration unvollständig",
+        "empty": "Kein durchsuchbarer Index",
+        "needs_rebuild": "Index muss neu erstellt werden",
+        "needs_reload": "Backend-Neustart erforderlich",
+        "building": "Index wird aktualisiert",
+        "unavailable": "Index nicht verfügbar",
+        "ready": "Index aktuell",
+    }.get(
+        state,
+        "Index aktuell" if health.get("rag_ready") else "Konfiguration erforderlich",
+    )
 
 
 def conversation_markdown():
@@ -326,12 +422,14 @@ with st.sidebar:
     with st.container(key="connection"):
         if backend_error:
             st.caption(":material/cloud_off: API nicht erreichbar")
-        elif not health.get("rag_ready"):
-            st.caption(":material/settings: Konfiguration erforderlich")
-        elif health.get("provider_circuit_state") == "open":
-            st.caption(":material/hourglass_top: Gemini pausiert")
         else:
             st.caption(":material/check_circle: API verbunden")
+            icon = "check_circle" if health.get("rag_ready") else "info"
+            st.caption(f":material/{icon}: {index_status_label(health)}")
+            if health.get("rag_ready") and "indexed_chunk_count" in health:
+                st.caption(f"{health['indexed_chunk_count']} Textabschnitte indexiert")
+            if health.get("provider_circuit_state") == "open":
+                st.caption(":material/hourglass_top: Gemini pausiert")
         if health.get("ollama_fallback_enabled"):
             st.caption("Ollama-Fallback aktiviert")
 
@@ -357,7 +455,7 @@ if not st.session_state.messages:
         if backend_error:
             st.caption("Warten auf die API-Verbindung.")
         elif not health.get("rag_ready"):
-            st.caption("Die Modell-Konfiguration ist noch nicht vollständig.")
+            st.caption(index_status_label(health))
         elif not selected_documents:
             st.caption("Kein Dokument im Suchbereich.")
         else:
@@ -397,7 +495,7 @@ for index, message in enumerate(st.session_state.messages):
                 )
         else:
             st.markdown(message["content"])
-            render_sources(message.get("sources", []))
+            render_sources(message.get("sources", []), index)
 
 st.chat_input(
     "Frage zu deinen Dokumenten",
@@ -440,7 +538,9 @@ if question and not chat_disabled:
             )
         else:
             st.markdown(message["content"])
-            render_sources(message.get("sources", []))
+            render_sources(
+                message.get("sources", []), len(st.session_state.messages) - 1
+            )
 elif question:
     error = backend_error or {
         "message": "Die Frage konnte nicht gesendet werden. Bitte den Suchbereich prüfen."

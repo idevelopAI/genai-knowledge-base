@@ -1,4 +1,6 @@
+import hashlib
 import io
+import json
 import re
 import uuid
 from dataclasses import dataclass
@@ -15,6 +17,15 @@ from pypdf.errors import PdfReadError
 
 
 ACTIVE_COLLECTION_FILENAME = ".active_collection"
+INDEX_METADATA_VERSION = 1
+
+
+@dataclass(frozen=True)
+class IndexHealth:
+    state: str
+    reason: str = ""
+    pdf_count: int = 0
+    chunk_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -41,6 +52,66 @@ def list_pdf_files(data_dir: str) -> list[Path]:
         ),
         key=lambda path: path.name,
     )
+
+
+def pdf_digest(path: Path) -> str:
+    with path.open("rb") as document:
+        return hashlib.file_digest(document, "sha256").hexdigest()
+
+
+def corpus_fingerprint(pdf_files: list[Path]) -> str:
+    manifest = sorted((path.name, pdf_digest(path)) for path in pdf_files)
+    return hashlib.sha256(json.dumps(manifest).encode("utf-8")).hexdigest()
+
+
+def index_settings(embedding_model: str, chunk_size: int, chunk_overlap: int) -> dict:
+    return {
+        "rag_schema": INDEX_METADATA_VERSION,
+        "rag_embedding_model": embedding_model,
+        "rag_chunk_size": chunk_size,
+        "rag_chunk_overlap": chunk_overlap,
+    }
+
+
+def read_index_status(
+    *,
+    data_dir: str,
+    persist_directory: str,
+    collection_name: str,
+    embedding_model: str,
+    chunk_size: int,
+    chunk_overlap: int,
+    loaded_collection: str,
+) -> IndexHealth:
+    if not Path(persist_directory).is_dir():
+        return IndexHealth("empty", "no_index")
+    active = get_active_collection_name(persist_directory, collection_name)
+    client = chromadb.PersistentClient(path=persist_directory)
+    try:
+        collection = client.get_collection(active, embedding_function=None)
+    except NotFoundError:
+        return IndexHealth("empty", "no_index")
+    count = collection.count()
+    if not count:
+        return IndexHealth("empty", "no_chunks")
+    metadata = collection.metadata or {}
+    pdf_count = int(metadata.get("rag_pdf_count", 0))
+    if metadata.get("rag_schema") != INDEX_METADATA_VERSION or not metadata.get(
+        "rag_corpus"
+    ):
+        return IndexHealth("needs_rebuild", "metadata_missing", pdf_count, count)
+    if any(
+        metadata.get(key) != value
+        for key, value in index_settings(
+            embedding_model, chunk_size, chunk_overlap
+        ).items()
+    ):
+        return IndexHealth("needs_rebuild", "settings_changed", pdf_count, count)
+    if corpus_fingerprint(list_pdf_files(data_dir)) != metadata["rag_corpus"]:
+        return IndexHealth("needs_rebuild", "documents_changed", pdf_count, count)
+    if loaded_collection != active:
+        return IndexHealth("needs_reload", "reload_required", pdf_count, count)
+    return IndexHealth("ready", pdf_count=pdf_count, chunk_count=count)
 
 
 def sanitize_filename(filename: str) -> str:
@@ -103,6 +174,7 @@ def validate_pdf_bytes(data: bytes, max_pages: int) -> int:
 def load_pdf_documents(pdf_files: list[Path]) -> list[Document]:
     documents = []
     for pdf_path in pdf_files:
+        revision = pdf_digest(pdf_path)
         try:
             reader = PdfReader(pdf_path)
         except (PdfReadError, OSError, ValueError, EOFError) as exc:
@@ -120,6 +192,7 @@ def load_pdf_documents(pdf_files: list[Path]) -> list[Document]:
                             "source": str(pdf_path),
                             "source_name": pdf_path.name,
                             "page": page_number,
+                            "source_sha256": revision,
                         },
                     )
                 )
@@ -174,6 +247,7 @@ def build_vector_db(
     pdf_files = list_pdf_files(data_dir)
     if not pdf_files:
         raise ValueError(f"No PDF files found in {data_dir}")
+    fingerprint = corpus_fingerprint(pdf_files)
 
     docs = load_pdf_documents(pdf_files)
     if not docs:
@@ -199,7 +273,15 @@ def build_vector_db(
         persist_directory=persist_directory,
         collection_name=versioned_collection_name,
         collection_configuration={"hnsw": {"space": "cosine"}},
+        collection_metadata={
+            **index_settings(embedding_model, chunk_size, chunk_overlap),
+            "rag_corpus": fingerprint,
+            "rag_pdf_count": len(pdf_files),
+        },
     )
+    if fingerprint != corpus_fingerprint(list_pdf_files(data_dir)):
+        delete_collection(persist_directory, versioned_collection_name)
+        raise ValueError("PDF files changed during indexing. Rebuild the index again.")
     set_active_collection_name(persist_directory, versioned_collection_name)
 
     return IndexStats(

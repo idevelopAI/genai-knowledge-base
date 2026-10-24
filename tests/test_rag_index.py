@@ -6,6 +6,23 @@ from langchain_core.documents import Document
 import rag_index
 
 
+def test_digest_detects_same_size_edits_even_with_unchanged_stat(tmp_path, monkeypatch):
+    pdf = tmp_path / "sample.pdf"
+    pdf.write_bytes(b"original")
+    original_stat = pdf.stat()
+    before = rag_index.pdf_digest(pdf)
+    pdf.write_bytes(b"modified")
+    original_method = Path.stat
+    monkeypatch.setattr(
+        Path,
+        "stat",
+        lambda path, **kwargs: (
+            original_stat if path == pdf else original_method(path, **kwargs)
+        ),
+    )
+    assert rag_index.pdf_digest(pdf) != before
+
+
 def configure_index_stubs(monkeypatch, from_documents):
     monkeypatch.setattr(
         rag_index,
@@ -80,6 +97,13 @@ def test_successful_index_build_activates_versioned_collection(tmp_path, monkeyp
     assert stats.collection_name.startswith("documents-")
     assert captured["collection_name"] == stats.collection_name
     assert captured["collection_configuration"] == {"hnsw": {"space": "cosine"}}
+    assert captured["collection_metadata"] == {
+        **rag_index.index_settings("test-model", 1000, 200),
+        "rag_corpus": rag_index.corpus_fingerprint(
+            rag_index.list_pdf_files(str(data_dir))
+        ),
+        "rag_pdf_count": 1,
+    }
     assert (
         rag_index.get_active_collection_name(str(vector_dir), "fallback")
         == stats.collection_name
@@ -98,6 +122,7 @@ def test_direct_pdf_loader_preserves_source_and_page_metadata():
         "source": str(pdf_path),
         "source_name": "sample_document.pdf",
         "page": 0,
+        "source_sha256": rag_index.pdf_digest(pdf_path),
     }
     assert "Retrieval-Augmented Generation" in documents[0].page_content
 
@@ -115,3 +140,60 @@ def test_list_pdf_files_is_case_insensitive_and_excludes_symlinks(
     files = rag_index.list_pdf_files(str(tmp_path))
 
     assert files == [lowercase, uppercase]
+
+
+def test_changed_corpus_during_build_keeps_previous_index(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    pdf = data / "sample.pdf"
+    pdf.write_bytes(b"original")
+    vector = tmp_path / "chroma"
+    rag_index.set_active_collection_name(str(vector), "previous")
+    deleted = []
+    configure_index_stubs(monkeypatch, lambda **kwargs: pdf.write_bytes(b"modified"))
+    monkeypatch.setattr(
+        rag_index, "delete_collection", lambda *args: deleted.append(args)
+    )
+    with pytest.raises(ValueError, match="changed during indexing"):
+        rag_index.build_vector_db(
+            data_dir=str(data),
+            persist_directory=str(vector),
+            embedding_model="test",
+            google_api_key="test",
+        )
+    assert rag_index.get_active_collection_name(str(vector), "fallback") == "previous"
+    assert len(deleted) == 1
+
+
+def test_real_chroma_build_persists_health_metadata(tmp_path, monkeypatch):
+    from langchain_core.embeddings import Embeddings
+
+    class FixedEmbeddings(Embeddings):
+        def embed_documents(self, texts):
+            return [[1.0, 0.0, 0.0] for _ in texts]
+
+        def embed_query(self, text):
+            return [1.0, 0.0, 0.0]
+
+    data = tmp_path / "data"
+    data.mkdir()
+    sample = Path(__file__).resolve().parents[1] / "data" / "sample_document.pdf"
+    (data / "sample.pdf").write_bytes(sample.read_bytes())
+    monkeypatch.setattr(
+        rag_index, "GoogleGenerativeAIEmbeddings", lambda **kwargs: FixedEmbeddings()
+    )
+    arguments = dict(
+        data_dir=str(data),
+        persist_directory=str(tmp_path / "chroma"),
+        embedding_model="test-model",
+        collection_name="test-index",
+        chunk_size=1000,
+        chunk_overlap=200,
+    )
+    stats = rag_index.build_vector_db(**arguments, google_api_key="test")
+    health = rag_index.read_index_status(
+        **arguments, loaded_collection=stats.collection_name
+    )
+    assert health.state == "ready"
+    assert health.pdf_count == 1
+    assert health.chunk_count == stats.chunks_created

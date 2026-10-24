@@ -7,6 +7,8 @@ langchain-google-genai
 langchain-chroma
 chromadb
 pypdf
+pypdfium2
+pillow
 python-dotenv
 streamlit
 requests

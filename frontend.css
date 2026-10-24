@@ -121,6 +121,20 @@ button { border-radius: 6px !important; }
     overflow: hidden;
     text-overflow: ellipsis;
 }
+.st-key-pdf_preview_fit [data-testid="stFullScreenFrame"] {
+    background: #f1f4f2;
+    display: flex;
+    justify-content: center;
+}
+.st-key-pdf_preview_fit [data-testid="stImage"] { padding: 0.75rem; }
+.st-key-pdf_preview_fit img {
+    display: block;
+    width: auto !important;
+    max-width: 100%;
+    max-height: max(240px, calc(100dvh - 390px));
+    object-fit: contain;
+    margin: 0 auto;
+}
 @media (max-width: 640px) {
     [data-testid="stMainBlockContainer"] { padding: 4.5rem 1rem 2rem; }
     [data-testid="stBottomBlockContainer"] { padding: 0.75rem 1rem 1rem; }

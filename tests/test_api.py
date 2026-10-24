@@ -28,6 +28,14 @@ import main  # noqa: E402
 client = TestClient(main.app)
 
 
+@pytest.fixture(autouse=True)
+def ready_index(monkeypatch):
+    # Provider/API tests use fake retrievers, not the user's persisted index.
+    monkeypatch.setattr(
+        main, "read_index_status", lambda **kwargs: main.IndexHealth("ready")
+    )
+
+
 def make_pdf_bytes(page_count: int = 1) -> bytes:
     output = BytesIO()
     writer = PdfWriter()

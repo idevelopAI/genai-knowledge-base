@@ -4,6 +4,7 @@ import logging
 import math
 import os
 import re
+import stat
 import tempfile
 import threading
 import time
@@ -22,6 +23,7 @@ from fastapi import (
     File,
     Header,
     HTTPException,
+    Query,
     Request,
     Response,
     UploadFile,
@@ -38,14 +40,17 @@ from generation_providers import (
     OllamaGenerationProvider,
 )
 from index_jobs import IndexJobStore, JobCapacityError
+from pdf_preview import PreviewBusyError, render_pdf_page
 from reliability import CircuitBreaker, CircuitOpenError, TTLCache
 from rag_index import (
+    IndexHealth,
     IndexStats,
     build_vector_db,
     delete_collection,
     get_active_collection_name,
     list_pdf_files,
     next_available_path,
+    read_index_status,
     sanitize_filename,
     save_pdf_bytes,
     set_active_collection_name,
@@ -240,6 +245,7 @@ class SourceDocument(BaseModel):
     source: str
     page: int | None = None
     excerpt: str
+    revision: str | None = None
 
 
 class QueryResponse(BaseModel):
@@ -687,6 +693,7 @@ def build_sources(docs: list[Document]) -> list[SourceDocument]:
                 source=_source_label(doc.metadata),
                 page=_page_number(doc.metadata),
                 excerpt=_clean_excerpt(doc.page_content),
+                revision=doc.metadata.get("source_sha256"),
             )
         )
     return sources
@@ -1019,12 +1026,38 @@ def _generate_answer(
     return answer, generation_provider.name
 
 
+def _index_health() -> IndexHealth:
+    if retriever is None or generation_provider is None:
+        return IndexHealth("unconfigured")
+    if index_rebuild_lock.locked():
+        return IndexHealth("building")
+    try:
+        return read_index_status(
+            data_dir=DATA_DIR,
+            persist_directory=CHROMA_DB_DIR,
+            collection_name=CHROMA_COLLECTION_NAME,
+            embedding_model=GEMINI_EMBEDDING_MODEL,
+            chunk_size=RAG_CHUNK_SIZE,
+            chunk_overlap=RAG_CHUNK_OVERLAP,
+            loaded_collection=getattr(retriever, "index_revision", ""),
+        )
+    except Exception as error:
+        logger.warning("rag_index_health_failed error_type=%s", type(error).__name__)
+        return IndexHealth("unavailable")
+
+
 @app.get("/health")
-async def health() -> dict[str, bool | str | int | float]:
+def health() -> dict[str, bool | str | int | float]:
     circuit = provider_circuit.snapshot()
+    index = _index_health()
     return {
         "status": "ok",
-        "rag_ready": retriever is not None and generation_provider is not None,
+        "model_configured": retriever is not None and generation_provider is not None,
+        "rag_ready": index.state == "ready",
+        "index_state": index.state,
+        "index_reason": index.reason,
+        "indexed_pdf_count": index.pdf_count,
+        "indexed_chunk_count": index.chunk_count,
         "generation_provider": (
             generation_provider.name
             if generation_provider is not None
@@ -1055,6 +1088,103 @@ async def health() -> dict[str, bool | str | int | float]:
 async def list_documents() -> DocumentListResponse:
     return DocumentListResponse(
         documents=[path.name for path in list_pdf_files(DATA_DIR)],
+    )
+
+
+def _read_preview_document(filename: str, revision: str | None) -> tuple[bytes, str]:
+    path = _document_path(filename)
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as document:
+            if not stat.S_ISREG(os.fstat(document.fileno()).st_mode):
+                raise HTTPException(status_code=404, detail="Document not found.")
+            contents = document.read(RAG_MAX_UPLOAD_BYTES + 1)
+    except OSError as error:
+        raise HTTPException(status_code=404, detail="Document not found.") from error
+    if len(contents) > RAG_MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413, detail="Document exceeds the preview size limit."
+        )
+    actual_revision = hashlib.sha256(contents).hexdigest()
+    if revision and not hmac.compare_digest(revision, actual_revision):
+        raise HTTPException(status_code=409, detail="The cited document has changed.")
+    return contents, actual_revision
+
+
+def _preview_page_count(contents: bytes) -> int:
+    try:
+        return validate_pdf_bytes(contents, RAG_MAX_PDF_PAGES)
+    except ValueError as error:
+        raise HTTPException(
+            status_code=422, detail="Document cannot be previewed."
+        ) from error
+
+
+@app.get(
+    "/documents/{filename}",
+    dependencies=[Depends(_require_api_token), Depends(_enforce_rate_limit)],
+)
+def document_details(
+    filename: str,
+    response: Response,
+    revision: str | None = Query(default=None, pattern="^[0-9a-f]{64}$"),
+) -> dict[str, str | int]:
+    contents, current_revision = _read_preview_document(filename, revision)
+    response.headers["Cache-Control"] = "no-store"
+    return {
+        "filename": filename,
+        "page_count": _preview_page_count(contents),
+        "revision": current_revision,
+    }
+
+
+@app.get(
+    "/documents/{filename}/pages/{page}",
+    dependencies=[Depends(_require_api_token), Depends(_enforce_rate_limit)],
+)
+def document_page(
+    filename: str,
+    page: int,
+    revision: str | None = Query(default=None, pattern="^[0-9a-f]{64}$"),
+) -> Response:
+    contents, _ = _read_preview_document(filename, revision)
+    if not 1 <= page <= _preview_page_count(contents):
+        raise HTTPException(status_code=422, detail="Page not found.")
+    try:
+        image = render_pdf_page(contents, page)
+    except PreviewBusyError as error:
+        raise HTTPException(
+            status_code=503,
+            detail="PDF renderer is busy.",
+            headers={"Retry-After": "5"},
+        ) from error
+    except ValueError as error:
+        raise HTTPException(
+            status_code=422, detail="Document cannot be previewed."
+        ) from error
+    return Response(
+        image, media_type="image/png", headers={"Cache-Control": "no-store"}
+    )
+
+
+@app.get(
+    "/documents/{filename}/file",
+    dependencies=[Depends(_require_api_token), Depends(_enforce_rate_limit)],
+)
+def download_document(
+    filename: str,
+    revision: str | None = Query(default=None, pattern="^[0-9a-f]{64}$"),
+) -> Response:
+    contents, _ = _read_preview_document(filename, revision)
+    _preview_page_count(contents)
+    return Response(
+        contents,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 
@@ -1181,6 +1311,12 @@ def ask_question(query: QueryRequest, request: Request) -> QueryResponse:
             detail="RAG service is not configured. Set GOOGLE_API_KEY before using /ask.",
         )
 
+    index = _index_health()
+    if index.state != "ready":
+        raise HTTPException(
+            status_code=503,
+            detail="The index is not ready. Check /health and rebuild or reload the index.",
+        )
     selected_documents = _validated_document_selection(query.documents)
     cache_key = _answer_cache_key(query.question, selected_documents)
     cached_response = answer_cache.get(cache_key)

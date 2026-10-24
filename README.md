@@ -47,9 +47,13 @@ API token and backend URLs, not the Google API key.
 - **Upload:** open **Hochladen**, choose a PDF, and click **Hochladen & indexieren**.
   Indexing runs in the background, with status shown in the sidebar.
 - **Answers:** expand **Quellen** to inspect filenames, page numbers, and excerpts.
+  **Quelle öffnen** opens the cited page, with page selection and a PDF download.
+  Replaced or deleted sources are reported instead of showing a different file.
   The header includes controls to start a new chat or download it as Markdown.
 - **Delete:** open **Verwalten**, select a PDF, and confirm **Dokument löschen**.
   Deletion rebuilds the remaining index; the last document cannot be deleted.
+- **Index status:** API connectivity and index readiness are shown separately.
+  Empty, outdated, or unavailable indexes disable questions, including cached answers.
 
 File changes run inside one indexing worker. Queued uploads stay outside the
 active PDF set, and a queued deletion does not remove its PDF early. Failed
@@ -68,7 +72,7 @@ chat. Other open sessions may still display their earlier answers.
 
 1. Index the included PDFs and select only `sample_document.pdf`.
 2. Ask: `Wie funktioniert Retrieval-Augmented Generation?`
-3. Expand the sources and compare the excerpt with the PDF.
+3. Expand the sources, click **Quelle öffnen**, and compare the cited PDF page.
 4. Repeat the question to exercise the answer cache.
 5. Upload a non-sensitive PDF, wait for completion, select it, and ask a specific
    question about its content.
@@ -131,8 +135,13 @@ allowing for configured primary attempts, optional fallback, and a 60-second
 retrieval/network margin. This is a client wait budget, not an end-to-end server
 deadline. Increase the override for slower local models or retrieval.
 
-Reindex after changing the embedding model or chunk settings, or when upgrading
-an index that predates the `source_name` metadata field.
+Reindex after changing the embedding model or chunk settings. Existing indexes
+without build metadata also need a one-time rebuild after upgrading. The app
+compares content fingerprints and build settings against the active collection;
+it does not automatically rebuild or consume embedding quota. After an external
+CLI rebuild, restart the backend to load the new collection.
+Health checks stream-hash the local PDFs without relying on timestamps; this
+favors correctness for a small corpus, but adds disk reads as the corpus grows.
 
 ### Optional Ollama Fallback
 
@@ -238,6 +247,9 @@ When `RAG_API_TOKEN` is configured, protected endpoints require
 | `GET` | `/health` | Public readiness/configuration summary |
 | `POST` | `/ask` | Question with optional `documents` filename list |
 | `GET` | `/documents` | Available PDF filenames |
+| `GET` | `/documents/{filename}` | Page count and content revision |
+| `GET` | `/documents/{filename}/pages/{page}` | One-based page preview as PNG |
+| `GET` | `/documents/{filename}/file` | Original PDF download |
 | `POST` | `/documents` | Multipart PDF upload and indexing job |
 | `DELETE` | `/documents/{filename}` | Deletion and indexing job |
 | `POST` | `/reindex` | Rebuild the index |
@@ -245,7 +257,19 @@ When `RAG_API_TOKEN` is configured, protected endpoints require
 
 Upload, deletion, and reindex return `202 Accepted`. Poll the `Location` header
 until the job is `completed` or `failed`. `/ask` returns an `answer` and `sources`
-containing filenames, one-based page numbers, and excerpts.
+containing filenames, one-based page numbers, excerpts, and content revisions.
+Preview and download routes honor the same authentication and rate limits as
+document operations. Pass the source's `revision` as a query parameter to reject
+a changed file with `409`; missing documents return `404`. Responses use
+`Cache-Control: no-store`. Streamlit fetches them server-side, without putting
+API tokens in browser URLs. Page rendering uses pypdfium2, with a 1,600-pixel
+maximum edge and serialized PDFium calls. Upload size/page limits also apply.
+
+`/health` stays `200` when the API is reachable. `model_configured` and
+`index_state` describe local readiness; `rag_ready` requires a current index.
+States include `empty`, `needs_rebuild`, `needs_reload`, `building`,
+`unconfigured`, and `unavailable`; `index_reason` explains rebuild/reload needs.
+These checks do not call Gemini or verify provider quota.
 
 Every API response carries `X-Request-ID`. Use it to correlate UI errors with
 logs (`docker compose logs backend`). Events include retrieval/generation
@@ -269,7 +293,8 @@ contain additional details. Transient provider errors return `503` and
   Citation presence does not prove a claim is supported. Prompt-injection
   instructions reduce risk but do not guarantee resistance to hostile PDFs.
   Chat history is displayed but not sent as conversation memory to `/ask`.
-- **PDF support:** text extraction only; scanned/image-only PDFs need OCR first.
+- **PDF support:** retrieval uses text extraction; scanned/image-only PDFs need
+  OCR first. Page previews are raster images, not a sandbox for hostile PDFs.
 - **Production changes:** use durable jobs, shared cache/rate limits, managed
   storage with backups, user-level access control, TLS, and deployment monitoring.
 
