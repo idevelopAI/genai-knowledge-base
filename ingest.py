@@ -1,3 +1,4 @@
+import argparse
 import os
 
 from dotenv import load_dotenv
@@ -22,7 +23,7 @@ GEMINI_EMBEDDING_MODEL = os.environ.get(
 )
 
 
-def build_vector_database():
+def build_vector_database(full_rebuild: bool = False):
     if not GOOGLE_API_KEY:
         raise ValueError("Sicherheitsfehler: GOOGLE_API_KEY wurde nicht gefunden!")
 
@@ -38,15 +39,22 @@ def build_vector_database():
         collection_name=CHROMA_COLLECTION_NAME,
         chunk_size=RAG_CHUNK_SIZE,
         chunk_overlap=RAG_CHUNK_OVERLAP,
+        reuse_embeddings=not full_rebuild,
     )
     if previous_collection_name != stats.collection_name:
         delete_collection(CHROMA_DB_DIR, previous_collection_name)
     print(
         "Datenbank erfolgreich erstellt: "
         f"{stats.pdf_count} PDFs, {stats.pages_loaded} Seiten, "
-        f"{stats.chunks_created} Chunks."
+        f"{stats.chunks_created} Chunks ({stats.chunks_reused} wiederverwendet)."
     )
 
 
 if __name__ == "__main__":
-    build_vector_database()
+    parser = argparse.ArgumentParser(description="Build the PDF vector index.")
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Re-embed every PDF instead of reusing unchanged embeddings.",
+    )
+    build_vector_database(full_rebuild=parser.parse_args().full)

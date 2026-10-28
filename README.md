@@ -99,9 +99,9 @@ flowchart LR
 
     API -- upload / delete / reindex --> Queue["Bounded job queue"]
     Queue --> Worker["Single indexing worker"]
-    Worker --> PDFs["PDFs: pypdf + chunking"]
+    Worker --> PDFs["New or changed PDFs: pypdf + chunking"]
     PDFs --> Embeddings["Gemini embeddings"]
-    Embeddings --> Version["New collection + activation"]
+    Embeddings --> Version["New collection + reused vectors + activation"]
     Version --> Chroma
 ```
 
@@ -140,6 +140,10 @@ without build metadata also need a one-time rebuild after upgrading. The app
 compares content fingerprints and build settings against the active collection;
 it does not automatically rebuild or consume embedding quota. After an external
 CLI rebuild, restart the backend to load the new collection.
+Rebuilds are incremental: PDFs whose filename and content hash match the active
+collection keep their stored embeddings, so uploads and deletions only embed new
+or changed files. Changing the embedding model or chunk settings re-embeds
+everything; `python ingest.py --full` forces that without a settings change.
 Health checks stream-hash the local PDFs without relying on timestamps; this
 favors correctness for a small corpus, but adds disk reads as the corpus grows.
 
@@ -285,7 +289,8 @@ contain additional details. Transient provider errors return `503` and
   This setup is single-instance, not distributed storage or a backup solution.
 - **Gemini:** one provider for embeddings and generation, configurable models,
   and a small integration surface. Availability, cost, and rate limits remain
-  external dependencies. Rebuilding embeds the full corpus and consumes quota.
+  external dependencies. Only new or changed PDFs consume embedding quota; a
+  settings change or `--full` rebuild embeds the whole corpus.
 - **In-memory state:** jobs, cache, circuit state, and rate limits are local to
   one backend process. Jobs are not durable across restarts; avoid stopping the
   service during indexing and back up PDFs before bulk changes. On startup, the

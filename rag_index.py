@@ -9,7 +9,6 @@ from pathlib import Path
 
 import chromadb
 from chromadb.errors import NotFoundError
-from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -39,6 +38,7 @@ class IndexStats:
     data_dir: str
     vector_store: str
     collection_name: str
+    chunks_reused: int = 0
 
 
 def list_pdf_files(data_dir: str) -> list[Path]:
@@ -63,7 +63,11 @@ def pdf_digest(path: Path) -> str:
 
 
 def corpus_fingerprint(pdf_files: list[Path]) -> str:
-    manifest = sorted((path.name, pdf_digest(path)) for path in pdf_files)
+    return _fingerprint_from_digests({path.name: pdf_digest(path) for path in pdf_files})
+
+
+def _fingerprint_from_digests(digests: dict[str, str]) -> str:
+    manifest = sorted(digests.items())
     return hashlib.sha256(json.dumps(manifest).encode("utf-8")).hexdigest()
 
 
@@ -271,6 +275,60 @@ def delete_collection(persist_directory: str, collection_name: str) -> None:
         return
 
 
+@dataclass(frozen=True)
+class ReusableChunks:
+    ids: list[str]
+    documents: list[str]
+    metadatas: list[dict]
+    embeddings: list
+
+
+def _reusable_chunks(
+    client,
+    collection_name: str,
+    settings: dict,
+    digests: dict[str, str],
+) -> dict[str, ReusableChunks]:
+    """Return stored chunks for PDFs whose name and content are unchanged."""
+    try:
+        collection = client.get_collection(collection_name, embedding_function=None)
+    except NotFoundError:
+        return {}
+    metadata = collection.metadata or {}
+    if any(metadata.get(key) != value for key, value in settings.items()):
+        return {}
+
+    reusable = {}
+    for name, digest in digests.items():
+        result = collection.get(
+            where={"$and": [{"source_name": name}, {"source_sha256": digest}]},
+            include=["documents", "metadatas", "embeddings"],
+        )
+        if not result["ids"]:
+            continue
+        reusable[name] = ReusableChunks(
+            ids=list(result["ids"]),
+            documents=list(result["documents"]),
+            metadatas=[dict(item) for item in result["metadatas"]],
+            embeddings=list(result["embeddings"]),
+        )
+    return reusable
+
+
+def _pdf_page_count(path: Path) -> int:
+    try:
+        return len(PdfReader(path).pages)
+    except (PdfReadError, OSError, ValueError, EOFError) as exc:
+        raise ValueError(f"Unable to read PDF {path.name!r}.") from exc
+
+
+def _add_in_batches(collection, *, max_batch_size: int, **records) -> None:
+    total = len(records["ids"])
+    for start in range(0, total, max_batch_size):
+        end = start + max_batch_size
+        collection.add(**{key: values[start:end] for key, values in records.items()})
+
+
 def build_vector_db(
     *,
     data_dir: str,
@@ -280,14 +338,32 @@ def build_vector_db(
     collection_name: str = "langchain",
     chunk_size: int = 1000,
     chunk_overlap: int = 200,
+    reuse_embeddings: bool = True,
 ) -> IndexStats:
     pdf_files = list_pdf_files(data_dir)
     if not pdf_files:
         raise ValueError(f"No PDF files found in {data_dir}")
-    fingerprint = corpus_fingerprint(pdf_files)
+    digests = {path.name: pdf_digest(path) for path in pdf_files}
+    fingerprint = _fingerprint_from_digests(digests)
+    settings = index_settings(embedding_model, chunk_size, chunk_overlap)
 
-    docs = load_pdf_documents(pdf_files)
-    if not docs:
+    client = chromadb.PersistentClient(path=persist_directory)
+    previous_collection_name = get_active_collection_name(
+        persist_directory, collection_name
+    )
+    reusable = (
+        _reusable_chunks(client, previous_collection_name, settings, digests)
+        if reuse_embeddings
+        else {}
+    )
+
+    # Only new or changed PDFs are read and embedded; the rest reuse stored vectors.
+    files_to_embed = [path for path in pdf_files if path.name not in reusable]
+    docs = load_pdf_documents(files_to_embed)
+    pages_loaded = len(docs) + sum(
+        _pdf_page_count(path) for path in pdf_files if path.name in reusable
+    )
+    if not pages_loaded:
         raise ValueError(f"No document pages could be loaded from {data_dir}")
 
     text_splitter = RecursiveCharacterTextSplitter(
@@ -295,28 +371,50 @@ def build_vector_db(
         chunk_overlap=chunk_overlap,
     )
     splits = text_splitter.split_documents(docs)
-    if not splits:
+    chunks_reused = sum(len(chunks.ids) for chunks in reusable.values())
+    if not splits and not chunks_reused:
         raise ValueError(f"No extractable text found in PDFs from {data_dir}")
-
-    embeddings = GoogleGenerativeAIEmbeddings(
-        model=embedding_model,
-        google_api_key=google_api_key,
-    )
 
     versioned_collection_name = f"{collection_name}-{uuid.uuid4().hex}"
     try:
-        Chroma.from_documents(
-            documents=splits,
-            embedding=embeddings,
-            persist_directory=persist_directory,
-            collection_name=versioned_collection_name,
-            collection_configuration={"hnsw": {"space": "cosine"}},
-            collection_metadata={
-                **index_settings(embedding_model, chunk_size, chunk_overlap),
+        collection = client.create_collection(
+            versioned_collection_name,
+            configuration={"hnsw": {"space": "cosine"}},
+            metadata={
+                **settings,
                 "rag_corpus": fingerprint,
                 "rag_pdf_count": len(pdf_files),
             },
+            embedding_function=None,
         )
+        max_batch_size = client.get_max_batch_size()
+        for path in pdf_files:
+            chunks = reusable.get(path.name)
+            if chunks is None:
+                continue
+            _add_in_batches(
+                collection,
+                max_batch_size=max_batch_size,
+                ids=chunks.ids,
+                documents=chunks.documents,
+                # The data directory may have moved since the previous build.
+                metadatas=[{**item, "source": str(path)} for item in chunks.metadatas],
+                embeddings=chunks.embeddings,
+            )
+        if splits:
+            embeddings = GoogleGenerativeAIEmbeddings(
+                model=embedding_model,
+                google_api_key=google_api_key,
+            )
+            texts = [split.page_content for split in splits]
+            _add_in_batches(
+                collection,
+                max_batch_size=max_batch_size,
+                ids=[str(uuid.uuid4()) for _ in splits],
+                documents=texts,
+                metadatas=[split.metadata for split in splits],
+                embeddings=embeddings.embed_documents(texts),
+            )
     except BaseException:
         # Embedding can fail partway (for example on quota); drop the partial build.
         try:
@@ -331,9 +429,10 @@ def build_vector_db(
 
     return IndexStats(
         pdf_count=len(pdf_files),
-        pages_loaded=len(docs),
-        chunks_created=len(splits),
+        pages_loaded=pages_loaded,
+        chunks_created=len(splits) + chunks_reused,
         data_dir=data_dir,
         vector_store=persist_directory,
         collection_name=versioned_collection_name,
+        chunks_reused=chunks_reused,
     )

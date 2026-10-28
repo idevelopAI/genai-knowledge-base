@@ -263,6 +263,7 @@ class IndexResponse(BaseModel):
     pdf_count: int
     pages_loaded: int
     chunks_created: int
+    chunks_reused: int = 0
 
 
 class IndexJobResponse(BaseModel):
@@ -569,6 +570,7 @@ def _index_response(stats: IndexStats, status: str = "indexed") -> IndexResponse
         pdf_count=stats.pdf_count,
         pages_loaded=stats.pages_loaded,
         chunks_created=stats.chunks_created,
+        chunks_reused=stats.chunks_reused,
     )
 
 
@@ -625,11 +627,12 @@ def _rebuild_vector_store(
                 )
         logger.info(
             "rag_index_rebuilt status=success request_id=%s pdf_count=%s "
-            "pages_loaded=%s chunks_created=%s elapsed_ms=%s",
+            "pages_loaded=%s chunks_created=%s chunks_reused=%s elapsed_ms=%s",
             effective_request_id,
             stats.pdf_count,
             stats.pages_loaded,
             stats.chunks_created,
+            stats.chunks_reused,
             _elapsed_ms(start_time),
         )
         return stats
