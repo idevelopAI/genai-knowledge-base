@@ -51,6 +51,7 @@ from rag_index import (
     list_pdf_files,
     next_available_path,
     read_index_status,
+    recover_interrupted_changes,
     sanitize_filename,
     save_pdf_bytes,
     set_active_collection_name,
@@ -528,6 +529,27 @@ def _build_fallback_provider() -> GenerationProvider | None:
     )
 
 
+def _recover_interrupted_index_jobs() -> None:
+    # Jobs are in-memory, so file changes from a job cut off by a restart are undone here.
+    try:
+        report = recover_interrupted_changes(DATA_DIR)
+    except OSError:
+        logger.exception("rag_startup_recovery_failed data_dir=%s", DATA_DIR)
+        return
+    for filename in report.restored:
+        logger.warning("rag_startup_recovery restored_deleted_file filename=%s", filename)
+    for backup_name in report.conflicting_backups:
+        logger.warning(
+            "rag_startup_recovery conflicting_deletion_backup filename=%s", backup_name
+        )
+    if report.removed_staging_dirs:
+        logger.info(
+            "rag_startup_recovery removed_upload_staging_dirs count=%s",
+            report.removed_staging_dirs,
+        )
+
+
+_recover_interrupted_index_jobs()
 retriever, generation_provider = _build_rag_components()
 fallback_provider = _build_fallback_provider()
 

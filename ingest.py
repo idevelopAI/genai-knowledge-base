@@ -2,7 +2,11 @@ import os
 
 from dotenv import load_dotenv
 
-from rag_index import build_vector_db
+from rag_index import (
+    build_vector_db,
+    delete_collection,
+    get_active_collection_name,
+)
 
 
 load_dotenv()
@@ -23,6 +27,9 @@ def build_vector_database():
         raise ValueError("Sicherheitsfehler: GOOGLE_API_KEY wurde nicht gefunden!")
 
     print(f"Lade PDFs aus '{DATA_DIR}'...")
+    previous_collection_name = get_active_collection_name(
+        CHROMA_DB_DIR, CHROMA_COLLECTION_NAME
+    )
     stats = build_vector_db(
         data_dir=DATA_DIR,
         persist_directory=CHROMA_DB_DIR,
@@ -32,6 +39,8 @@ def build_vector_database():
         chunk_size=RAG_CHUNK_SIZE,
         chunk_overlap=RAG_CHUNK_OVERLAP,
     )
+    if previous_collection_name != stats.collection_name:
+        delete_collection(CHROMA_DB_DIR, previous_collection_name)
     print(
         "Datenbank erfolgreich erstellt: "
         f"{stats.pdf_count} PDFs, {stats.pages_loaded} Seiten, "

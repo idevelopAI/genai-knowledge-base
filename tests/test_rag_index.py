@@ -197,3 +197,102 @@ def test_real_chroma_build_persists_health_metadata(tmp_path, monkeypatch):
     assert health.state == "ready"
     assert health.pdf_count == 1
     assert health.chunk_count == stats.chunks_created
+
+
+def test_failed_index_build_deletes_partial_collection(tmp_path, monkeypatch):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "sample.pdf").write_bytes(b"placeholder")
+    created = []
+    deleted = []
+
+    def fail_partway(**kwargs):
+        created.append(kwargs["collection_name"])
+        raise RuntimeError("quota exhausted")
+
+    configure_index_stubs(monkeypatch, fail_partway)
+    monkeypatch.setattr(
+        rag_index,
+        "delete_collection",
+        lambda persist_directory, name: deleted.append(name),
+    )
+
+    with pytest.raises(RuntimeError, match="quota exhausted"):
+        rag_index.build_vector_db(
+            data_dir=str(data_dir),
+            persist_directory=str(tmp_path / "chroma"),
+            embedding_model="test-model",
+            google_api_key="test-key",
+            collection_name="documents",
+        )
+
+    assert deleted == created
+
+
+def test_failed_partial_cleanup_keeps_original_error(tmp_path, monkeypatch):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "sample.pdf").write_bytes(b"placeholder")
+
+    def fail_build(**kwargs):
+        raise RuntimeError("embedding failed")
+
+    def fail_cleanup(persist_directory, name):
+        raise OSError("disk unavailable")
+
+    configure_index_stubs(monkeypatch, fail_build)
+    monkeypatch.setattr(rag_index, "delete_collection", fail_cleanup)
+
+    with pytest.raises(RuntimeError, match="embedding failed"):
+        rag_index.build_vector_db(
+            data_dir=str(data_dir),
+            persist_directory=str(tmp_path / "chroma"),
+            embedding_model="test-model",
+            google_api_key="test-key",
+            collection_name="documents",
+        )
+
+
+def test_recovery_restores_interrupted_deletion(tmp_path):
+    backup = tmp_path / f".guide.pdf.{'a' * 32}.deleting"
+    backup.write_bytes(b"pdf")
+
+    report = rag_index.recover_interrupted_changes(str(tmp_path))
+
+    assert report.restored == ["guide.pdf"]
+    assert (tmp_path / "guide.pdf").read_bytes() == b"pdf"
+    assert not backup.exists()
+
+
+def test_recovery_never_overwrites_existing_document(tmp_path):
+    (tmp_path / "guide.pdf").write_bytes(b"current")
+    backup = tmp_path / f".guide.pdf.{'b' * 32}.deleting"
+    backup.write_bytes(b"old")
+
+    report = rag_index.recover_interrupted_changes(str(tmp_path))
+
+    assert report.restored == []
+    assert report.conflicting_backups == [backup.name]
+    assert (tmp_path / "guide.pdf").read_bytes() == b"current"
+    assert backup.exists()
+
+
+def test_recovery_removes_upload_staging_and_ignores_other_files(tmp_path):
+    staging = tmp_path / ".upload-abc123"
+    staging.mkdir()
+    (staging / "new.pdf").write_bytes(b"pdf")
+    (tmp_path / "keep.pdf").write_bytes(b"pdf")
+    (tmp_path / ".notes.deleting").write_bytes(b"not a backup")
+
+    report = rag_index.recover_interrupted_changes(str(tmp_path))
+
+    assert report.removed_staging_dirs == 1
+    assert not staging.exists()
+    assert (tmp_path / "keep.pdf").exists()
+    assert (tmp_path / ".notes.deleting").exists()
+
+
+def test_recovery_handles_missing_data_directory(tmp_path):
+    report = rag_index.recover_interrupted_changes(str(tmp_path / "missing"))
+
+    assert report == rag_index.RecoveryReport([], [], 0)

@@ -2,6 +2,7 @@ import hashlib
 import io
 import json
 import re
+import shutil
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,8 @@ from pypdf.errors import PdfReadError
 
 
 ACTIVE_COLLECTION_FILENAME = ".active_collection"
+DELETION_BACKUP_PATTERN = re.compile(r"^\.(?P<name>.+)\.[0-9a-f]{32}\.deleting$")
+UPLOAD_STAGING_PREFIX = ".upload-"
 INDEX_METADATA_VERSION = 1
 
 
@@ -112,6 +115,40 @@ def read_index_status(
     if loaded_collection != active:
         return IndexHealth("needs_reload", "reload_required", pdf_count, count)
     return IndexHealth("ready", pdf_count=pdf_count, chunk_count=count)
+
+
+@dataclass(frozen=True)
+class RecoveryReport:
+    restored: list[str]
+    conflicting_backups: list[str]
+    removed_staging_dirs: int
+
+
+def recover_interrupted_changes(data_dir: str) -> RecoveryReport:
+    """Undo file changes left behind when an indexing job was interrupted."""
+    directory = Path(data_dir)
+    restored: list[str] = []
+    conflicting: list[str] = []
+    removed_staging_dirs = 0
+    if not directory.is_dir():
+        return RecoveryReport(restored, conflicting, removed_staging_dirs)
+
+    for path in sorted(directory.iterdir()):
+        if path.is_symlink():
+            continue
+        match = DELETION_BACKUP_PATTERN.fullmatch(path.name)
+        if match and path.is_file():
+            original = directory / match["name"]
+            if original.exists():
+                # Never overwrite a file that reappeared; leave it for manual review.
+                conflicting.append(path.name)
+                continue
+            path.replace(original)
+            restored.append(original.name)
+        elif path.name.startswith(UPLOAD_STAGING_PREFIX) and path.is_dir():
+            shutil.rmtree(path)
+            removed_staging_dirs += 1
+    return RecoveryReport(restored, conflicting, removed_staging_dirs)
 
 
 def sanitize_filename(filename: str) -> str:
@@ -267,18 +304,26 @@ def build_vector_db(
     )
 
     versioned_collection_name = f"{collection_name}-{uuid.uuid4().hex}"
-    Chroma.from_documents(
-        documents=splits,
-        embedding=embeddings,
-        persist_directory=persist_directory,
-        collection_name=versioned_collection_name,
-        collection_configuration={"hnsw": {"space": "cosine"}},
-        collection_metadata={
-            **index_settings(embedding_model, chunk_size, chunk_overlap),
-            "rag_corpus": fingerprint,
-            "rag_pdf_count": len(pdf_files),
-        },
-    )
+    try:
+        Chroma.from_documents(
+            documents=splits,
+            embedding=embeddings,
+            persist_directory=persist_directory,
+            collection_name=versioned_collection_name,
+            collection_configuration={"hnsw": {"space": "cosine"}},
+            collection_metadata={
+                **index_settings(embedding_model, chunk_size, chunk_overlap),
+                "rag_corpus": fingerprint,
+                "rag_pdf_count": len(pdf_files),
+            },
+        )
+    except BaseException:
+        # Embedding can fail partway (for example on quota); drop the partial build.
+        try:
+            delete_collection(persist_directory, versioned_collection_name)
+        except Exception:
+            pass
+        raise
     if fingerprint != corpus_fingerprint(list_pdf_files(data_dir)):
         delete_collection(persist_directory, versioned_collection_name)
         raise ValueError("PDF files changed during indexing. Rebuild the index again.")

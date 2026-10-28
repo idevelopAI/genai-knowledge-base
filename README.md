@@ -288,7 +288,9 @@ contain additional details. Transient provider errors return `503` and
   external dependencies. Rebuilding embeds the full corpus and consumes quota.
 - **In-memory state:** jobs, cache, circuit state, and rate limits are local to
   one backend process. Jobs are not durable across restarts; avoid stopping the
-  service during indexing and back up PDFs before bulk changes.
+  service during indexing and back up PDFs before bulk changes. On startup, the
+  backend restores PDFs from interrupted deletions and removes staged uploads;
+  an interrupted upload that already reached `data/` stays and needs a rebuild.
 - **Answer quality:** similarity scores are not confidence probabilities.
   Citation presence does not prove a claim is supported. Prompt-injection
   instructions reduce risk but do not guarantee resistance to hostile PDFs.
